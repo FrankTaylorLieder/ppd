@@ -373,22 +373,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3c8dda44ff03a2f238717214da50f65d5a53b45cd213a7370424ffdb6fae815"
 
 [[package]]
-name = "mme-display-firmware"
-version = "0.1.0"
-dependencies = [
- "cortex-m",
- "embedded-graphics",
- "heapless",
- "micromath",
- "panic-halt",
- "pyportal",
- "serde",
- "serde-json-core",
- "usb-device",
- "usbd-serial",
-]
-
-[[package]]
 name = "modular-bitfield"
 version = "0.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -494,6 +478,22 @@ name = "portable-atomic"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
+
+[[package]]
+name = "ppd-firmware"
+version = "0.1.0"
+dependencies = [
+ "cortex-m",
+ "embedded-graphics",
+ "heapless",
+ "micromath",
+ "panic-halt",
+ "pyportal",
+ "serde",
+ "serde-json-core",
+ "usb-device",
+ "usbd-serial",
+]
 
 [[package]]
 name = "proc-macro2"

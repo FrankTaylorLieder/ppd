@@ -13,7 +13,7 @@ const PID: u16 = 0x0001;
 const MAX_PREVIEW_MESSAGES: usize = 3;
 
 #[derive(Parser)]
-#[command(name = "mme-cli", about = "Send commands to the PyPortal MME display")]
+#[command(name = "ppd-cli", about = "Send commands to the PyPortal MME display")]
 struct Cli {
     /// Serial port to use (auto-detected if omitted)
     #[arg(long, global = true)]

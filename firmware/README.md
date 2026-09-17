@@ -1,4 +1,4 @@
-# mme-display-firmware
+# ppd-firmware
 
 Bare-metal Rust firmware for the Adafruit PyPortal M4 Express (ATSAMD51J20A).
 Brings up the parallel ILI9341 display and a USB CDC-ACM serial port, then
@@ -93,9 +93,9 @@ Use `../cli` rather than crafting this by hand — it auto-detects the port by
 VID:PID and handles the framing:
 
 ```sh
-mme-cli text "Hello, world!"
-mme-cli badge 3 --message "Alice: hi" --message "Bob: meeting at 3"
-mme-cli badge 0
+ppd-cli text "Hello, world!"
+ppd-cli badge 3 --message "Alice: hi" --message "Bob: meeting at 3"
+ppd-cli badge 0
 ```
 
 For manual testing you can also just write a line to the serial port, e.g.:
@@ -109,7 +109,7 @@ echo '{"text":{"msg":"hi"}}' > /dev/cu.usbmodem2101
 - **Nothing shows up on USB at all, even bootloader mode**: check for a
   physical connector fault — the PyPortal's micro-USB port is soldered
   directly to the PCB with no strain relief and is a known weak point.
-- **Board enumerates but the CLI can't find it**: run `mme-cli list` from
+- **Board enumerates but the CLI can't find it**: run `ppd-cli list` from
   the `cli` crate to see what the OS actually sees; on macOS both a
   `/dev/cu.*` and `/dev/tty.*` node show up for the same device, which is
   expected.
