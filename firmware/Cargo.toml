@@ -10,6 +10,7 @@ usb-device = "0.3"
 usbd-serial = "0.2"
 embedded-graphics = "0.8"
 heapless = "0.8"
+micromath = "2"
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde-json-core = "0.6"
 panic-halt = "1.0"

@@ -1,4 +1,3 @@
-use std::io::Write;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -22,8 +21,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Display a text message on the screen
+    /// Queue a text message; the display shows a "N waiting" badge until viewed
     Text { message: String },
+    /// Pop and show the next queued message on screen
+    View,
     /// List candidate serial ports
     List,
 }
@@ -32,6 +33,7 @@ enum Command {
 #[serde(rename_all = "snake_case")]
 enum Message<'a> {
     Text { msg: &'a str },
+    View {},
 }
 
 fn find_port() -> Result<String> {
@@ -87,15 +89,17 @@ fn main() -> Result<()> {
         .with_context(|| format!("opening {port_name}"))?;
 
     match cli.command {
-        Command::Text { message } => {
-            let payload = Message::Text { msg: &message };
-            let mut line = serde_json::to_string(&payload)?;
-            line.push('\n');
-            port.write_all(line.as_bytes())
-                .context("writing to serial port")?;
-        }
+        Command::Text { message } => send(&mut *port, &Message::Text { msg: &message })?,
+        Command::View => send(&mut *port, &Message::View {})?,
         Command::List => unreachable!(),
     }
 
     Ok(())
+}
+
+fn send(port: &mut dyn serialport::SerialPort, payload: &Message) -> Result<()> {
+    let mut line = serde_json::to_string(payload)?;
+    line.push('\n');
+    port.write_all(line.as_bytes())
+        .context("writing to serial port")
 }

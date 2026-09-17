@@ -22,25 +22,85 @@ use cortex_m::peripheral::NVIC;
 use core::cell::RefCell;
 use core::mem::MaybeUninit;
 
-use embedded_graphics::mono_font::ascii::FONT_10X20;
+use embedded_graphics::mono_font::ascii::{FONT_10X20, FONT_6X10};
 use embedded_graphics::mono_font::MonoTextStyle;
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::*;
-use embedded_graphics::text::Text;
+use embedded_graphics::primitives::{Circle, PrimitiveStyle, Rectangle};
+use embedded_graphics::text::{Alignment, Text, TextStyleBuilder};
+use embedded_graphics::Pixel;
 
-use heapless::Vec as HVec;
+use heapless::{Deque, String as HString, Vec as HVec};
+use micromath::F32Ext;
 use serde::Deserialize;
 
 use panic_halt as _;
 
 const LINE_CAPACITY: usize = 256;
+const MSG_CAPACITY: usize = 64;
+const QUEUE_CAPACITY: usize = 8;
+
+// Off-screen back buffer for the animated badge, sized just large enough to
+// cover its motion range. A full 320x240 framebuffer would be ~150KB, most
+// of this chip's 192KB RAM; scoping the buffer to only the animated region
+// keeps double-buffering cheap while still eliminating on-glass flicker.
+const BADGE_W: usize = 220;
+const BADGE_H: usize = 170;
+
+struct BadgeBuf {
+    pixels: [Rgb565; BADGE_W * BADGE_H],
+}
+
+impl BadgeBuf {
+    fn new() -> Self {
+        BadgeBuf {
+            pixels: [Rgb565::BLACK; BADGE_W * BADGE_H],
+        }
+    }
+
+    fn clear_to_black(&mut self) {
+        self.pixels.fill(Rgb565::BLACK);
+    }
+}
+
+impl OriginDimensions for BadgeBuf {
+    fn size(&self) -> Size {
+        Size::new(BADGE_W as u32, BADGE_H as u32)
+    }
+}
+
+impl DrawTarget for BadgeBuf {
+    type Color = Rgb565;
+    type Error = core::convert::Infallible;
+
+    fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
+    where
+        I: IntoIterator<Item = Pixel<Self::Color>>,
+    {
+        for Pixel(point, color) in pixels {
+            if point.x >= 0 && (point.x as usize) < BADGE_W && point.y >= 0 && (point.y as usize) < BADGE_H
+            {
+                self.pixels[point.y as usize * BADGE_W + point.x as usize] = color;
+            }
+        }
+        Ok(())
+    }
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Command<'a> {
     Text { msg: &'a str },
+    View {},
 }
 
+enum Mode {
+    Idle,
+    Notify,
+    Viewing,
+}
+
+static mut BADGE_BUF: MaybeUninit<BadgeBuf> = MaybeUninit::uninit();
 static mut USB_ALLOCATOR: MaybeUninit<UsbBusAllocator<UsbBus>> = MaybeUninit::uninit();
 static USB_BUS: Mutex<RefCell<Option<UsbDevice<UsbBus>>>> = Mutex::new(RefCell::new(None));
 static USB_SERIAL: Mutex<RefCell<Option<SerialPort<UsbBus>>>> = Mutex::new(RefCell::new(None));
@@ -72,11 +132,17 @@ fn main() -> ! {
     );
     backlight.into_push_pull_output().set_high().unwrap();
 
+    let size = disp.bounding_box().size;
+    let cx = size.width as i32 / 2;
+    let cy = size.height as i32 / 2;
     let style = MonoTextStyle::new(&FONT_10X20, Rgb565::WHITE);
+    let small_style = MonoTextStyle::new(&FONT_6X10, Rgb565::WHITE);
+
     disp.clear(Rgb565::BLACK).unwrap();
     Text::new("waiting for message...", Point::new(10, 100), style)
         .draw(&mut disp)
         .unwrap();
+    let mut mode = Mode::Idle;
 
     let bus_allocator = unsafe {
         USB_ALLOCATOR.write(bsp::usb_allocator(
@@ -113,23 +179,152 @@ fn main() -> ! {
         NVIC::unmask(interrupt::USB_TRCPT1);
     }
 
+    let badge_buf: &mut BadgeBuf = unsafe { BADGE_BUF.write(BadgeBuf::new()) };
+    let badge_area = Rectangle::new(
+        Point::new(cx - 110, cy - 125),
+        Size::new(BADGE_W as u32, BADGE_H as u32),
+    );
+
+    let mut queue: Deque<HString<MSG_CAPACITY>, QUEUE_CAPACITY> = Deque::new();
+    let mut tick: u32 = 0;
+
     loop {
         let line = cortex_m::interrupt::free(|cs| PENDING_LINE.borrow(cs).borrow_mut().take());
 
         if let Some(line) = line {
             red_led.set_high().unwrap();
             if let Ok(text) = core::str::from_utf8(&line) {
-                if let Ok((Command::Text { msg }, _)) =
-                    serde_json_core::from_str::<Command>(text)
-                {
-                    disp.clear(Rgb565::BLACK).unwrap();
-                    Text::new(msg, Point::new(10, 100), style)
-                        .draw(&mut disp)
-                        .unwrap();
+                if let Ok((cmd, _)) = serde_json_core::from_str::<Command>(text) {
+                    match cmd {
+                        Command::Text { msg } => {
+                            let mut owned: HString<MSG_CAPACITY> = HString::new();
+                            let _ = owned.push_str(msg);
+                            if queue.is_full() {
+                                queue.pop_front();
+                            }
+                            let _ = queue.push_back(owned);
+
+                            if !matches!(mode, Mode::Notify) {
+                                disp.clear(Rgb565::BLACK).unwrap();
+                                let centered =
+                                    TextStyleBuilder::new().alignment(Alignment::Center).build();
+                                Text::with_text_style(
+                                    "messages waiting - send `view`",
+                                    Point::new(cx, cy + 70),
+                                    small_style,
+                                    centered,
+                                )
+                                .draw(&mut disp)
+                                .unwrap();
+                                mode = Mode::Notify;
+                            }
+                            tick = 0;
+                        }
+                        Command::View {} => match queue.pop_front() {
+                            Some(next) => {
+                                disp.clear(Rgb565::BLACK).unwrap();
+                                Text::new(next.as_str(), Point::new(10, 100), style)
+                                    .draw(&mut disp)
+                                    .unwrap();
+                                if !queue.is_empty() {
+                                    let remaining = remaining_label(queue.len() as u32);
+                                    Text::new(remaining, Point::new(10, 140), small_style)
+                                        .draw(&mut disp)
+                                        .unwrap();
+                                }
+                                mode = Mode::Viewing;
+                            }
+                            None => {
+                                disp.clear(Rgb565::BLACK).unwrap();
+                                Text::new("no messages waiting", Point::new(10, 100), style)
+                                    .draw(&mut disp)
+                                    .unwrap();
+                                mode = Mode::Idle;
+                            }
+                        },
+                    }
                 }
             }
             red_led.set_low().unwrap();
         }
+
+        let frame_delay_ms: u16 = match mode {
+            Mode::Idle | Mode::Viewing => 20,
+            Mode::Notify => {
+                // Compose the badge into an off-screen buffer, then push it
+                // to the panel in a single contiguous transfer. This avoids
+                // both the on-glass black-then-red flash of clear+draw, and
+                // the visible "wipe" of drawing a circle pixel-by-pixel
+                // directly over the bus.
+                badge_buf.clear_to_black();
+                draw_notification(
+                    badge_buf,
+                    (BADGE_W / 2) as i32,
+                    85,
+                    tick,
+                    queue.len() as u32,
+                    style,
+                );
+                disp.fill_contiguous(&badge_area, badge_buf.pixels.iter().copied())
+                    .unwrap();
+                tick = tick.wrapping_add(1);
+                40
+            }
+        };
+
+        delay.delay_ms(frame_delay_ms);
+    }
+}
+
+fn draw_notification<D>(disp: &mut D, cx: i32, cy: i32, tick: u32, count: u32, style: MonoTextStyle<Rgb565>)
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    // Lissajous-ish wobble: more horizontal swing than vertical bob, kept
+    // within the dirty rectangle cleared by the caller.
+    let bob_y = ((tick as f32) * 0.2).sin() * 18.0;
+    let bob_x = ((tick as f32) * 0.12).cos() * 40.0;
+    let badge_center = Point::new(cx + bob_x as i32, cy - 40 + bob_y as i32);
+
+    let _ = Circle::with_center(badge_center, 110)
+        .into_styled(PrimitiveStyle::with_fill(Rgb565::RED))
+        .draw(disp);
+
+    let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
+    let _ = Text::with_text_style(
+        count_label(count),
+        badge_center + Point::new(0, 7),
+        style,
+        centered,
+    )
+    .draw(disp);
+}
+
+fn count_label(n: u32) -> &'static str {
+    match n {
+        0 => "0",
+        1 => "1",
+        2 => "2",
+        3 => "3",
+        4 => "4",
+        5 => "5",
+        6 => "6",
+        7 => "7",
+        8 => "8",
+        _ => "9+",
+    }
+}
+
+fn remaining_label(n: u32) -> &'static str {
+    match n {
+        1 => "1 more waiting",
+        2 => "2 more waiting",
+        3 => "3 more waiting",
+        4 => "4 more waiting",
+        5 => "5 more waiting",
+        6 => "6 more waiting",
+        7 => "7 more waiting",
+        _ => "more waiting",
     }
 }
 
