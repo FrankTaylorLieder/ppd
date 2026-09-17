@@ -67,15 +67,38 @@ again and retry.
 The firmware enumerates as a USB CDC serial device with VID:PID
 `0x1209:0x0001` (a [pid.codes](https://pid.codes) test allocation — fine for
 personal projects, not for redistribution) and accepts one JSON object per
-line:
+line. It is stateless — it just renders whatever the last command said;
+there's no on-device message queue, so the caller owns any notion of how
+many messages are "waiting".
+
+Two commands:
 
 ```json
 {"text":{"msg":"Hello, world!"}}
 ```
 
-Use `../cli` (`mme-cli text "Hello, world!"`) rather than crafting this by
-hand — it auto-detects the port by VID:PID and handles the framing. For
-manual testing you can also just write a line to the serial port, e.g.:
+Shows a single message full-screen.
+
+```json
+{"badge":{"count":3,"messages":["Alice: hi","Bob: meeting at 3"]}}
+```
+
+Shows a bouncing badge with `count` on it, plus up to 3 preview lines below
+(`messages` is optional and capped at `MAX_PREVIEW_MESSAGES` in
+`src/main.rs` — sending more makes the whole command fail to parse and get
+silently dropped). A `count` of `0` shows a static "nothing to do" icon
+instead of the animation, ignoring `messages`.
+
+Use `../cli` rather than crafting this by hand — it auto-detects the port by
+VID:PID and handles the framing:
+
+```sh
+mme-cli text "Hello, world!"
+mme-cli badge 3 --message "Alice: hi" --message "Bob: meeting at 3"
+mme-cli badge 0
+```
+
+For manual testing you can also just write a line to the serial port, e.g.:
 
 ```sh
 echo '{"text":{"msg":"hi"}}' > /dev/cu.usbmodem2101
