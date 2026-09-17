@@ -8,6 +8,10 @@ use serialport::SerialPortType;
 const VID: u16 = 0x1209;
 const PID: u16 = 0x0001;
 
+/// Must match `MAX_PREVIEW_MESSAGES` in the firmware; the device silently
+/// drops the whole command if more are sent.
+const MAX_PREVIEW_MESSAGES: usize = 3;
+
 #[derive(Parser)]
 #[command(name = "mme-cli", about = "Send commands to the PyPortal MME display")]
 struct Cli {
@@ -21,10 +25,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Queue a text message; the display shows a "N waiting" badge until viewed
+    /// Show a single message full-screen
     Text { message: String },
-    /// Pop and show the next queued message on screen
-    View,
+    /// Show the "N waiting" badge animation with an optional preview list;
+    /// count 0 shows a static "nothing to do" icon instead
+    Badge {
+        count: u32,
+        /// Preview line to show below the badge (repeatable, max 3)
+        #[arg(long = "message", value_name = "MESSAGE")]
+        messages: Vec<String>,
+    },
     /// List candidate serial ports
     List,
 }
@@ -32,8 +42,13 @@ enum Command {
 #[derive(serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 enum Message<'a> {
-    Text { msg: &'a str },
-    View {},
+    Text {
+        msg: &'a str,
+    },
+    Badge {
+        count: u32,
+        messages: &'a [&'a str],
+    },
 }
 
 fn find_port() -> Result<String> {
@@ -90,7 +105,22 @@ fn main() -> Result<()> {
 
     match cli.command {
         Command::Text { message } => send(&mut *port, &Message::Text { msg: &message })?,
-        Command::View => send(&mut *port, &Message::View {})?,
+        Command::Badge { count, messages } => {
+            if messages.len() > MAX_PREVIEW_MESSAGES {
+                bail!(
+                    "at most {MAX_PREVIEW_MESSAGES} preview messages are supported, got {}",
+                    messages.len()
+                );
+            }
+            let refs: Vec<&str> = messages.iter().map(String::as_str).collect();
+            send(
+                &mut *port,
+                &Message::Badge {
+                    count,
+                    messages: &refs,
+                },
+            )?
+        }
         Command::List => unreachable!(),
     }
 

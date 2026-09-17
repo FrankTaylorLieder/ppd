@@ -9,7 +9,7 @@ cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
 usb-device = "0.3"
 usbd-serial = "0.2"
 embedded-graphics = "0.8"
-heapless = "0.8"
+heapless = { version = "0.8", features = ["serde"] }
 micromath = "2"
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde-json-core = "0.6"
