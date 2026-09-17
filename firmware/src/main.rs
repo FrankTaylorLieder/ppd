@@ -94,7 +94,14 @@ impl DrawTarget for BadgeBuf {
 #[serde(rename_all = "snake_case")]
 enum Command<'a> {
     /// Show a single message full-screen.
-    Text { msg: &'a str },
+    Text {
+        msg: &'a str,
+        /// Shown small and gray in the top-right corner. The firmware has
+        /// no real-time clock, so the caller supplies an already-formatted
+        /// string; empty (the default) draws nothing.
+        #[serde(default)]
+        updated_at: &'a str,
+    },
     /// Show the "N waiting" badge animation with a small preview of
     /// messages below it. A count of 0 shows a static "nothing to do" icon
     /// instead of the animation.
@@ -102,6 +109,8 @@ enum Command<'a> {
         count: u32,
         #[serde(default)]
         messages: HVec<&'a str, MAX_PREVIEW_MESSAGES>,
+        #[serde(default)]
+        updated_at: &'a str,
     },
 }
 
@@ -148,6 +157,7 @@ fn main() -> ! {
     let cy = size.height as i32 / 2;
     let style = MonoTextStyle::new(&FONT_10X20, Rgb565::WHITE);
     let small_style = MonoTextStyle::new(&FONT_6X10, Rgb565::WHITE);
+    let gray_style = MonoTextStyle::new(&FONT_6X10, Rgb565::new(18, 36, 18));
 
     disp.clear(Rgb565::BLACK).unwrap();
     Text::new("waiting for message...", Point::new(10, 100), style)
@@ -207,14 +217,19 @@ fn main() -> ! {
             if let Ok(text) = core::str::from_utf8(&line) {
                 if let Ok((cmd, _)) = serde_json_core::from_str::<Command>(text) {
                     match cmd {
-                        Command::Text { msg } => {
+                        Command::Text { msg, updated_at } => {
                             disp.clear(Rgb565::BLACK).unwrap();
                             Text::new(msg, Point::new(10, 100), style)
                                 .draw(&mut disp)
                                 .unwrap();
+                            draw_timestamp(&mut disp, size, updated_at, gray_style);
                             mode = Mode::Static;
                         }
-                        Command::Badge { count, messages } => {
+                        Command::Badge {
+                            count,
+                            messages,
+                            updated_at,
+                        } => {
                             disp.clear(Rgb565::BLACK).unwrap();
                             if count == 0 {
                                 draw_sleep_icon(&mut disp, cx, cy, style);
@@ -233,6 +248,7 @@ fn main() -> ! {
                                 tick = 0;
                                 mode = Mode::Notify;
                             }
+                            draw_timestamp(&mut disp, size, updated_at, gray_style);
                         }
                     }
                 }
@@ -294,6 +310,23 @@ fn draw_notification<D>(
         badge_center + Point::new(0, 7),
         style,
         centered,
+    )
+    .draw(disp);
+}
+
+fn draw_timestamp<D>(disp: &mut D, size: Size, text: &str, style: MonoTextStyle<Rgb565>)
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    if text.is_empty() {
+        return;
+    }
+    let right_aligned = TextStyleBuilder::new().alignment(Alignment::Right).build();
+    let _ = Text::with_text_style(
+        text,
+        Point::new(size.width as i32 - 4, 12),
+        style,
+        right_aligned,
     )
     .draw(disp);
 }

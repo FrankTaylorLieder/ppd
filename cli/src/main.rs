@@ -44,10 +44,12 @@ enum Command {
 enum Message<'a> {
     Text {
         msg: &'a str,
+        updated_at: &'a str,
     },
     Badge {
         count: u32,
         messages: &'a [&'a str],
+        updated_at: &'a str,
     },
 }
 
@@ -103,8 +105,16 @@ fn main() -> Result<()> {
         .open()
         .with_context(|| format!("opening {port_name}"))?;
 
+    let updated_at = chrono::Local::now().format("%H:%M:%S").to_string();
+
     match cli.command {
-        Command::Text { message } => send(&mut *port, &Message::Text { msg: &message })?,
+        Command::Text { message } => send(
+            &mut *port,
+            &Message::Text {
+                msg: &message,
+                updated_at: &updated_at,
+            },
+        )?,
         Command::Badge { count, messages } => {
             if messages.len() > MAX_PREVIEW_MESSAGES {
                 bail!(
@@ -118,6 +128,7 @@ fn main() -> Result<()> {
                 &Message::Badge {
                     count,
                     messages: &refs,
+                    updated_at: &updated_at,
                 },
             )?
         }

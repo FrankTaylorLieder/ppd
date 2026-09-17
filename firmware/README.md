@@ -89,6 +89,11 @@ Shows a bouncing badge with `count` on it, plus up to 3 preview lines below
 silently dropped). A `count` of `0` shows a static "nothing to do" icon
 instead of the animation, ignoring `messages`.
 
+Both commands also take an optional `updated_at` string, drawn small and
+gray in the top-right corner (e.g. `"14:32:05"`). The firmware has no
+real-time clock, so this is opaque display text supplied by the caller, not
+something it computes itself; omitting it (or sending `""`) draws nothing.
+
 Use `../cli` rather than crafting this by hand — it auto-detects the port by
 VID:PID and handles the framing:
 
