@@ -277,7 +277,7 @@ fn draw_notification<D>(
     let bob_x = ((tick as f32) * 0.12).cos() * 40.0;
     let badge_center = Point::new(cx + bob_x as i32, baseline_y + bob_y as i32);
 
-    let _ = Circle::with_center(badge_center, 110)
+    let _ = Circle::with_center(badge_center, 74)
         .into_styled(PrimitiveStyle::with_fill(Rgb565::RED))
         .draw(disp);
 
