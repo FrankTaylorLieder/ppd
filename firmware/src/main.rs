@@ -34,6 +34,7 @@ use embedded_graphics::Pixel;
 use heapless::{String as HString, Vec as HVec};
 use micromath::F32Ext;
 use serde::Deserialize;
+use static_cell::StaticCell;
 
 use panic_halt as _;
 
@@ -139,8 +140,20 @@ enum Mode {
     Animated,
 }
 
+// `static mut`: BADGE_BUF is only ever touched from `main`'s own
+// (non-returning) loop, never from an interrupt, so it doesn't need
+// `'static`-reference safety the way USB_ALLOCATOR below does. It's a
+// static purely to keep its ~28KB (BADGE_W * BADGE_H * size_of::<Rgb565>())
+// out of the call stack rather than to satisfy the borrow checker; `unsafe`
+// is how we assert we're only initializing it once, up front.
 static mut BADGE_BUF: MaybeUninit<BadgeBuf> = MaybeUninit::uninit();
-static mut USB_ALLOCATOR: MaybeUninit<UsbBusAllocator<UsbBus>> = MaybeUninit::uninit();
+// `UsbDevice`/`SerialPort` (built from this allocator, below) borrow it with
+// a genuine `'static` lifetime per the `usb-device` API, which a
+// `Mutex<RefCell<_>>` guard (as used for USB_BUS/USB_SERIAL/etc.) can't
+// provide — a guard's lifetime is tied to its borrow, not `'static`.
+// `StaticCell` gives out that `&'static mut` safely (it panics rather than
+// aliasing if `init` is ever called twice), so no `unsafe` is needed here.
+static USB_ALLOCATOR: StaticCell<UsbBusAllocator<UsbBus>> = StaticCell::new();
 static USB_BUS: Mutex<RefCell<Option<UsbDevice<UsbBus>>>> = Mutex::new(RefCell::new(None));
 static USB_SERIAL: Mutex<RefCell<Option<SerialPort<UsbBus>>>> = Mutex::new(RefCell::new(None));
 static LINE_BUF: Mutex<RefCell<HVec<u8, LINE_CAPACITY>>> = Mutex::new(RefCell::new(HVec::new()));
@@ -184,15 +197,13 @@ fn main() -> ! {
         .unwrap();
     let mut mode = Mode::Static;
 
-    let bus_allocator = unsafe {
-        USB_ALLOCATOR.write(bsp::usb_allocator(
-            pins.usb.usb_dm,
-            pins.usb.usb_dp,
-            peripherals.usb,
-            &mut clocks,
-            &mut peripherals.mclk,
-        ))
-    };
+    let bus_allocator = USB_ALLOCATOR.init(bsp::usb_allocator(
+        pins.usb.usb_dm,
+        pins.usb.usb_dp,
+        peripherals.usb,
+        &mut clocks,
+        &mut peripherals.mclk,
+    ));
 
     cortex_m::interrupt::free(|cs| {
         USB_SERIAL
@@ -210,6 +221,11 @@ fn main() -> ! {
         ));
     });
 
+    // `unsafe` unconditionally, straight from `cortex-m`: setting interrupt
+    // priority and unmasking are raw NVIC register writes, and there's no
+    // safe wrapper — the caller has to be trusted to not enable an interrupt
+    // whose handler would violate what `cortex_m::interrupt::Mutex`'s
+    // critical sections assume elsewhere in this file.
     unsafe {
         core.NVIC.set_priority(interrupt::USB_OTHER, 1);
         core.NVIC.set_priority(interrupt::USB_TRCPT0, 1);
@@ -219,6 +235,8 @@ fn main() -> ! {
         NVIC::unmask(interrupt::USB_TRCPT1);
     }
 
+    // Safe: this is the only place BADGE_BUF is initialized, and it happens
+    // once before the loop below (which never returns) starts using it.
     let badge_buf: &mut BadgeBuf = unsafe { BADGE_BUF.write(BadgeBuf::new()) };
     let badge_top = cy - 110;
     let badge_area = Rectangle::new(
@@ -375,20 +393,9 @@ where
         .draw(disp);
 
     let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
-    let _ = Text::with_text_style(
-        "Zzz",
-        Point::new(cx - 60, cy - 95),
-        style,
-        centered,
-    )
-    .draw(disp);
-    let _ = Text::with_text_style(
-        "nothing to do",
-        Point::new(cx, cy + 90),
-        style,
-        centered,
-    )
-    .draw(disp);
+    let _ = Text::with_text_style("Zzz", Point::new(cx - 60, cy - 95), style, centered).draw(disp);
+    let _ =
+        Text::with_text_style("nothing to do", Point::new(cx, cy + 90), style, centered).draw(disp);
 }
 
 fn poll_usb() {
