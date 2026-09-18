@@ -58,6 +58,12 @@ const BADGE_W: usize = 140;
 const BADGE_H: usize = 100;
 const BADGE_DIAMETER: u32 = 56;
 
+// Paces the main loop: ~25fps, smooth enough for the badge's slow wobble
+// while keeping the SPI/CPU cost of redrawing it low. Also sets the wobble's
+// real-time speed, since `tick` (and so the animation phase) advances once
+// per loop iteration regardless of mode.
+const FRAME_DELAY_MS: u16 = 40;
+
 struct BadgeBuf {
     pixels: [Rgb565; BADGE_W * BADGE_H],
 }
@@ -129,7 +135,8 @@ enum Command<'a> {
 enum Mode {
     /// Nothing animating; whatever was last drawn stays on screen as-is.
     Static,
-    Notify,
+    /// Notification badge, redrawn with a wobble each frame.
+    Animated,
 }
 
 static mut BADGE_BUF: MaybeUninit<BadgeBuf> = MaybeUninit::uninit();
@@ -265,7 +272,7 @@ fn main() -> ! {
                                 }
                                 badge_count = count;
                                 tick = 0;
-                                mode = Mode::Notify;
+                                mode = Mode::Animated;
                             }
                             draw_timestamp(&mut disp, size, updated_at, gray_style);
                         }
@@ -275,31 +282,27 @@ fn main() -> ! {
             red_led.set_low().unwrap();
         }
 
-        let frame_delay_ms: u16 = match mode {
-            Mode::Static => 20,
-            Mode::Notify => {
-                // Compose the badge into an off-screen buffer, then push it
-                // to the panel in a single contiguous transfer. This avoids
-                // both the on-glass black-then-red flash of clear+draw, and
-                // the visible "wipe" of drawing a circle pixel-by-pixel
-                // directly over the bus.
-                badge_buf.clear_to_black();
-                draw_notification(
-                    badge_buf,
-                    (BADGE_W / 2) as i32,
-                    (BADGE_H / 2) as i32,
-                    tick,
-                    badge_count,
-                    style,
-                );
-                disp.fill_contiguous(&badge_area, badge_buf.pixels.iter().copied())
-                    .unwrap();
-                tick = tick.wrapping_add(1);
-                40
-            }
-        };
+        if let Mode::Animated = mode {
+            // Compose the badge into an off-screen buffer, then push it
+            // to the panel in a single contiguous transfer. This avoids
+            // both the on-glass black-then-red flash of clear+draw, and
+            // the visible "wipe" of drawing a circle pixel-by-pixel
+            // directly over the bus.
+            badge_buf.clear_to_black();
+            draw_notification(
+                badge_buf,
+                (BADGE_W / 2) as i32,
+                (BADGE_H / 2) as i32,
+                tick,
+                badge_count,
+                style,
+            );
+            disp.fill_contiguous(&badge_area, badge_buf.pixels.iter().copied())
+                .unwrap();
+            tick = tick.wrapping_add(1);
+        }
 
-        delay.delay_ms(frame_delay_ms);
+        delay.delay_ms(FRAME_DELAY_MS);
     }
 }
 
