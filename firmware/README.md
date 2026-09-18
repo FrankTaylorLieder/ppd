@@ -83,11 +83,12 @@ Shows a single message full-screen.
 {"badge":{"count":3,"messages":["Alice: hi","Bob: meeting at 3"]}}
 ```
 
-Shows a bouncing badge with `count` on it, plus up to 3 preview lines below
-(`messages` is optional and capped at `MAX_PREVIEW_MESSAGES` in
-`src/main.rs` — sending more makes the whole command fail to parse and get
-silently dropped). A `count` of `0` shows a static "nothing to do" icon
-instead of the animation, ignoring `messages`.
+Shows a bouncing badge with `count` on it, plus a preview list below it —
+as many `messages` lines as fit on screen (currently 7); any beyond that are
+silently ignored. The wire protocol itself caps at `MAX_PREVIEW_MESSAGES` in
+`src/main.rs` (currently 16) — sending more than that makes the whole
+command fail to parse and get silently dropped. A `count` of `0` shows a
+static "nothing to do" icon instead of the animation, ignoring `messages`.
 
 Both commands also take an optional `updated_at` string, drawn small and
 gray in the top-right corner (e.g. `"14:32:05"`). The firmware has no

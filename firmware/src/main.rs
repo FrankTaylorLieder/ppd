@@ -38,14 +38,25 @@ use serde::Deserialize;
 use panic_halt as _;
 
 const LINE_CAPACITY: usize = 256;
-const MAX_PREVIEW_MESSAGES: usize = 3;
+// Wire-protocol cap on how many preview messages a command may carry. This is
+// deliberately larger than what the screen can show at once (see
+// `PREVIEW_LINE_PITCH` / the space check in the render loop below) — extras
+// beyond what fits are silently ignored rather than the whole command
+// failing to parse.
+const MAX_PREVIEW_MESSAGES: usize = 16;
+const PREVIEW_LINE_PITCH: i32 = 16;
+const PREVIEW_BOTTOM_MARGIN: i32 = 8;
 
 // Off-screen back buffer for the animated badge, sized just large enough to
 // cover its motion range. A full 320x240 framebuffer would be ~150KB, most
 // of this chip's 192KB RAM; scoping the buffer to only the animated region
 // keeps double-buffering cheap while still eliminating on-glass flicker.
-const BADGE_W: usize = 220;
-const BADGE_H: usize = 170;
+//
+// Kept small (vs. an earlier, larger badge) to leave room for
+// MAX_PREVIEW_MESSAGES lines of text below it.
+const BADGE_W: usize = 140;
+const BADGE_H: usize = 100;
+const BADGE_DIAMETER: u32 = 56;
 
 struct BadgeBuf {
     pixels: [Rgb565; BADGE_W * BADGE_H],
@@ -104,7 +115,8 @@ enum Command<'a> {
     },
     /// Show the "N waiting" badge animation with a small preview of
     /// messages below it. A count of 0 shows a static "nothing to do" icon
-    /// instead of the animation.
+    /// instead of the animation. `messages` beyond how many lines fit on
+    /// screen are silently ignored.
     Badge {
         count: u32,
         #[serde(default)]
@@ -201,10 +213,13 @@ fn main() -> ! {
     }
 
     let badge_buf: &mut BadgeBuf = unsafe { BADGE_BUF.write(BadgeBuf::new()) };
+    let badge_top = cy - 110;
     let badge_area = Rectangle::new(
-        Point::new(cx - 110, cy - 125),
+        Point::new(cx - (BADGE_W / 2) as i32, badge_top),
         Size::new(BADGE_W as u32, BADGE_H as u32),
     );
+    // Preview lines start just below the badge area.
+    let badge_bottom = badge_top + BADGE_H as i32;
 
     let mut badge_count: u32 = 0;
     let mut tick: u32 = 0;
@@ -235,14 +250,18 @@ fn main() -> ! {
                                 draw_sleep_icon(&mut disp, cx, cy, style);
                                 mode = Mode::Static;
                             } else {
-                                // Badge motion occupies roughly [cy-125, cy+45]; keep the
-                                // preview lines below that and within the panel's height.
-                                let mut y = cy + 60;
+                                // Fill the remaining screen space with as many preview
+                                // lines as fit, ignoring any beyond that.
+                                let mut y = badge_bottom + 15;
+                                let bottom_limit = size.height as i32 - PREVIEW_BOTTOM_MARGIN;
                                 for m in messages.iter() {
+                                    if y + FONT_6X10.character_size.height as i32 > bottom_limit {
+                                        break;
+                                    }
                                     Text::new(m, Point::new(10, y), small_style)
                                         .draw(&mut disp)
                                         .unwrap();
-                                    y += 16;
+                                    y += PREVIEW_LINE_PITCH;
                                 }
                                 badge_count = count;
                                 tick = 0;
@@ -265,7 +284,14 @@ fn main() -> ! {
                 // the visible "wipe" of drawing a circle pixel-by-pixel
                 // directly over the bus.
                 badge_buf.clear_to_black();
-                draw_notification(badge_buf, (BADGE_W / 2) as i32, 85, tick, badge_count, style);
+                draw_notification(
+                    badge_buf,
+                    (BADGE_W / 2) as i32,
+                    (BADGE_H / 2) as i32,
+                    tick,
+                    badge_count,
+                    style,
+                );
                 disp.fill_contiguous(&badge_area, badge_buf.pixels.iter().copied())
                     .unwrap();
                 tick = tick.wrapping_add(1);
@@ -289,11 +315,11 @@ fn draw_notification<D>(
 {
     // Lissajous-ish wobble: more horizontal swing than vertical bob, kept
     // within the dirty rectangle cleared by the caller.
-    let bob_y = ((tick as f32) * 0.2).sin() * 18.0;
-    let bob_x = ((tick as f32) * 0.12).cos() * 40.0;
+    let bob_y = ((tick as f32) * 0.2).sin() * 14.0;
+    let bob_x = ((tick as f32) * 0.12).cos() * 30.0;
     let badge_center = Point::new(cx + bob_x as i32, baseline_y + bob_y as i32);
 
-    let _ = Circle::with_center(badge_center, 74)
+    let _ = Circle::with_center(badge_center, BADGE_DIAMETER)
         .into_styled(PrimitiveStyle::with_fill(Rgb565::RED))
         .draw(disp);
 

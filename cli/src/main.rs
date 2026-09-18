@@ -9,8 +9,10 @@ const VID: u16 = 0x1209;
 const PID: u16 = 0x0001;
 
 /// Must match `MAX_PREVIEW_MESSAGES` in the firmware; the device silently
-/// drops the whole command if more are sent.
-const MAX_PREVIEW_MESSAGES: usize = 3;
+/// drops the whole command if more are sent. This is a generous
+/// wire-protocol cap, not the number of lines actually shown — the firmware
+/// only draws as many as fit on screen and ignores the rest.
+const MAX_PREVIEW_MESSAGES: usize = 16;
 
 #[derive(Parser)]
 #[command(name = "ppd-cli", about = "Send commands to the PyPortal MME display")]
@@ -31,7 +33,8 @@ enum Command {
     /// count 0 shows a static "nothing to do" icon instead
     Badge {
         count: u32,
-        /// Preview line to show below the badge (repeatable, max 3)
+        /// Preview line to show below the badge (repeatable, max 16; only as
+        /// many as fit on screen are actually shown)
         #[arg(long = "message", value_name = "MESSAGE")]
         messages: Vec<String>,
     },
