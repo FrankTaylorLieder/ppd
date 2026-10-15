@@ -67,9 +67,9 @@ again and retry.
 The firmware enumerates as a USB CDC serial device with VID:PID
 `0x1209:0x0001` (a [pid.codes](https://pid.codes) test allocation — fine for
 personal projects, not for redistribution) and accepts one JSON object per
-line. It is stateless — it just renders whatever the last command said;
-there's no on-device message queue, so the caller owns any notion of how
-many messages are "waiting".
+line. For messages it just renders whatever the last command said; there's
+no on-device message queue, so the caller owns any notion of how many
+messages are "waiting".
 
 Two commands:
 
@@ -117,7 +117,9 @@ bottom-right corner, or `--:--:--` until the clock has been set.
 
 ### Temperature screen
 
-The on-board ADT7410 sensor is read once a minute. The messages screen shows
+The on-board ADT7410 sensor is read once a minute, with a fixed calibration
+offset (`TEMP_OFFSET_CENTI` in `src/main.rs`, currently −8.2°C) for the
+heat of the board and backlight around it. The messages screen shows
 the latest reading small in the top-left corner. A second screen shows it
 large, with a graph of the last 24h below it.
 
@@ -147,6 +149,7 @@ ppd-cli badge 3 --message "Alice: hi" --message "Bob: meeting at 3"
 ppd-cli badge 0
 ppd-cli sync-time
 ppd-cli tap
+ppd-cli readings --since 24h
 ```
 
 For manual testing you can also just write a line to the serial port, e.g.:
@@ -168,6 +171,45 @@ The first boot with this firmware, or after a change to the storage format,
 wipes the flash and shows "preparing storage (one-time)..." for several
 seconds. Anything else on the flash, such as an old CircuitPython
 filesystem, is lost. See `src/templog.rs` for the layout.
+
+To pull stored readings:
+
+```json
+{"readings":{"since":"2026-10-14T00:00:00Z"}}
+```
+
+`since` is a UTC date-time in ISO 8601 form: `YYYY-MM-DD`, optionally
+followed by `THH:MM` or `THH:MM:SS`, optionally followed by `Z`. It's
+always taken as UTC; other offsets aren't accepted. Like the other
+commands, this also takes optional `now`/`utc_offset` (which stay Unix
+seconds). This is the one command the device replies to: one line per
+reading at or after `since`, oldest first, then a count:
+
+```json
+{"t":"2026-10-15T10:12:18Z","c":21.43}
+{"t":"2026-10-15T10:13:17Z","c":21.44}
+{"done":{"count":2}}
+```
+
+`t` is the reading's time in UTC and `c` the temperature in °C. A malformed
+`since` gets `{"error":"<message>"}` instead. Readings over a year old are
+never returned, even while still in flash. The display freezes while the
+reply is sent (a day's readings take well under a second; a full year,
+~20MB, roughly a minute), and a command sent meanwhile may be lost. If the
+host stops reading for 2 seconds, the device gives up and carries on.
+
+The CLI prints the same lines with `t` converted to local time
+(`2026-10-15T11:12:18+01:00`), or exactly as sent with `--utc`. Its
+`--since` takes a duration back from now (`30m`, `24h`, `7d`, `2w`), `today`
+or `yesterday` (from midnight), plain English (`"yesterday 6pm"`, `"last
+monday"`, `"3 days ago"`; bare weekdays mean the most recent one, and dates
+like `01/10/2026` are read day-first), or a local date/time (`2026-10-01`,
+`2026-10-01T12:00`, or RFC 3339 with an offset). The count goes to stderr,
+so stdout is just the readings:
+
+```sh
+ppd-cli readings --since yesterday > since-yesterday.jsonl
+```
 
 ## Troubleshooting
 

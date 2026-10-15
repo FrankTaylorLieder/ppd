@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 
+mod datetime;
 mod flash;
 mod templog;
 
@@ -19,6 +20,7 @@ use hal::usb::UsbBus;
 
 use usb_device::bus::UsbBusAllocator;
 use usb_device::prelude::*;
+use usb_device::UsbError;
 use usbd_serial::{SerialPort, USB_CLASS_CDC};
 
 use cortex_m::interrupt::Mutex;
@@ -87,6 +89,11 @@ const ADT7410_CONFIG_16BIT: u8 = 0x80;
 // A 16-bit conversion takes up to 240ms; wait this long after configuring
 // before the first read so it isn't stale.
 const ADT7410_FIRST_CONVERSION_MS: u16 = 250;
+// Added to every reading, in centi-°C. The sensor sits on the board and
+// reads warm from the board's and backlight's own heat: it read 29.2°C in a
+// 21.0°C room. A fixed offset is an approximation, since that self-heating
+// varies with the room and how long the board has been on.
+const TEMP_OFFSET_CENTI: i16 = -820;
 
 const TEMP_SAMPLE_INTERVAL_S: u64 = 60;
 // The temperature screen graphs this many of the most recent samples (24h).
@@ -115,6 +122,12 @@ const GRAPH_MIN_RANGE: i32 = 200;
 // A press must read the same for this many consecutive frames to count, to
 // ride out contact bounce as a finger lands or lifts.
 const TOUCH_DEBOUNCE_FRAMES: u8 = 2;
+
+// Readings older than this are never returned, even while still in the log.
+const READINGS_MAX_AGE_S: i64 = 365 * 24 * 60 * 60;
+// While sending readings, give up if the host takes no data for about this
+// long (e.g. it closed the port mid-stream), rather than hang.
+const SERIAL_WRITE_TIMEOUT_MS: u32 = 2000;
 
 // `with_internal_32kosc` routes the internal ultra-low-power oscillator's
 // 1.024kHz output to the RTC, which counts it with no prescaler.
@@ -208,6 +221,18 @@ enum Command<'a> {
     /// Acts as if the screen had been tapped: switches between the messages
     /// and temperature screens. Useful for testing without touching it.
     Tap {},
+    /// Send back the stored readings taken at or after `since`, a UTC
+    /// date-time like `2026-10-14T00:00:00Z` (see `datetime::parse_utc`):
+    /// one `{"t":"<UTC date-time>","c":<°C>}` line each, oldest first, then
+    /// `{"done":{"count":<n>}}`. A malformed `since` gets
+    /// `{"error":"<message>"}` instead. Nothing else runs while they're sent.
+    Readings {
+        since: &'a str,
+        #[serde(default)]
+        now: Option<i64>,
+        #[serde(default)]
+        utc_offset: Option<i32>,
+    },
 }
 
 /// What a received line asks the main loop to do. Extracted from `Command`
@@ -223,6 +248,12 @@ enum Event {
         utc_offset: Option<i32>,
     },
     Tap,
+    Readings {
+        /// Unix time, or None if it couldn't be parsed.
+        since: Option<i64>,
+        now: Option<i64>,
+        utc_offset: Option<i32>,
+    },
 }
 
 fn parse_command(line: &[u8]) -> Option<Command<'_>> {
@@ -242,6 +273,15 @@ fn parse_event(line: &[u8]) -> Option<Event> {
         } => Event::Message { now, utc_offset },
         Command::Time { now, utc_offset } => Event::Time { now, utc_offset },
         Command::Tap {} => Event::Tap,
+        Command::Readings {
+            since,
+            now,
+            utc_offset,
+        } => Event::Readings {
+            since: datetime::parse_utc(since),
+            now,
+            utc_offset,
+        },
     })
 }
 
@@ -518,14 +558,19 @@ fn main() -> ! {
         qspi_pins.pa10,
         qspi_pins.pa11,
     );
-    let mut log = templog::TempLog::open(flash, || {
-        let _ = Text::new(
-            "preparing storage (one-time)...",
-            Point::new(10, 140),
-            small_style,
-        )
-        .draw(&mut disp);
-    });
+    let mut log = templog::TempLog::open(
+        flash,
+        || {
+            let _ = Text::new(
+                "preparing storage (one-time)...",
+                Point::new(10, 140),
+                small_style,
+            )
+            .draw(&mut disp);
+        },
+        // Readings logged before the offset existed get it applied once.
+        TEMP_OFFSET_CENTI,
+    );
 
     let mut history = History::new();
     history.push(temperature);
@@ -642,6 +687,26 @@ fn main() -> ! {
                     }
                 }
                 Some(Event::Time { now, utc_offset }) => clock.sync(now, utc_offset),
+                Some(Event::Readings {
+                    since,
+                    now,
+                    utc_offset,
+                }) => {
+                    if let Some(now) = now {
+                        clock.sync(now, utc_offset);
+                    }
+                    match since {
+                        Some(since) => {
+                            let oldest = clock.now().map_or(0, |now| now - READINGS_MAX_AGE_S);
+                            send_readings(log.as_mut(), since.max(oldest).max(0) as u32);
+                        }
+                        None => {
+                            serial_write_all(
+                                b"{\"error\":\"since must be a UTC date-time like 2026-10-14T00:00:00Z\"}\n",
+                            );
+                        }
+                    }
+                }
                 Some(Event::Tap) => switch_to = Some(screen.other()),
                 None => {}
             }
@@ -694,7 +759,11 @@ fn main() -> ! {
         }
 
         if uptime >= next_sample_secs {
-            next_sample_secs += TEMP_SAMPLE_INTERVAL_S;
+            // Skip any intervals missed while the loop was busy (e.g.
+            // sending a long run of readings) rather than catching up with
+            // several readings in a row.
+            next_sample_secs +=
+                TEMP_SAMPLE_INTERVAL_S * ((uptime - next_sample_secs) / TEMP_SAMPLE_INTERVAL_S + 1);
             // Retry the init each time if the sensor wasn't found at boot, so
             // a transient I2C failure doesn't leave it blank until reset.
             temperature = if sensor_ok || adt7410_init(&mut i2c) {
@@ -1080,7 +1149,7 @@ fn adt7410_read(i2c: &mut bsp::I2c) -> Option<i16> {
     EhalI2c::write_read(i2c, ADT7410_ADDR, &[ADT7410_REG_TEMP], &mut raw).ok()?;
     // 16-bit two's complement, 1/128 °C per LSB.
     let raw = i16::from_be_bytes(raw) as i32;
-    Some((raw * 100 / 128) as i16)
+    Some((raw * 100 / 128) as i16 + TEMP_OFFSET_CENTI)
 }
 
 /// Draws the temperature in the top-left corner, opposite `draw_timestamp`
@@ -1126,6 +1195,63 @@ where
     let _ = Text::with_text_style("Zzz", Point::new(cx - 60, cy - 95), style, centered).draw(disp);
     let _ =
         Text::with_text_style("nothing to do", Point::new(cx, cy + 90), style, centered).draw(disp);
+}
+
+/// Streams the readings at or after `since` to the host (see
+/// `Command::Readings`). With no working flash, just sends a count of 0.
+fn send_readings(log: Option<&mut templog::TempLog>, since: u32) {
+    let mut count: u32 = 0;
+    if let Some(log) = log {
+        log.for_each_since(since, |unix_time, centi_c| {
+            let mut line: HString<48> = HString::new();
+            let sign = if centi_c < 0 { "-" } else { "" };
+            let abs = (centi_c as i32).abs();
+            let _ = write!(
+                line,
+                "{{\"t\":\"{}\",\"c\":{sign}{}.{:02}}}\n",
+                datetime::format_utc(unix_time as i64),
+                abs / 100,
+                abs % 100
+            );
+            count += 1;
+            serial_write_all(line.as_bytes())
+        });
+    }
+    let mut done: HString<32> = HString::new();
+    let _ = write!(done, "{{\"done\":{{\"count\":{count}}}}}\n");
+    serial_write_all(done.as_bytes());
+}
+
+/// Writes all of `data` to the USB serial port, waiting for the host to
+/// take it. The USB interrupts do the actual sending, so this just retries
+/// outside the critical section until there's room. Returns false if the
+/// host stops taking data for SERIAL_WRITE_TIMEOUT_MS.
+fn serial_write_all(mut data: &[u8]) -> bool {
+    // ~0.1ms at the 120MHz core clock.
+    const RETRY_CYCLES: u32 = 12_000;
+    let mut idle_retries: u32 = 0;
+    while !data.is_empty() {
+        let result =
+            cortex_m::interrupt::free(|cs| match USB_SERIAL.borrow(cs).borrow_mut().as_mut() {
+                Some(serial) => serial.write(data),
+                None => Err(UsbError::InvalidState),
+            });
+        match result {
+            Ok(written) => {
+                data = &data[written..];
+                idle_retries = 0;
+            }
+            Err(UsbError::WouldBlock) => {
+                idle_retries += 1;
+                if idle_retries > SERIAL_WRITE_TIMEOUT_MS * 10 {
+                    return false;
+                }
+                cortex_m::asm::delay(RETRY_CYCLES);
+            }
+            Err(_) => return false,
+        }
+    }
+    true
 }
 
 fn poll_usb() {

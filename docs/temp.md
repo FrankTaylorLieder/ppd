@@ -36,7 +36,10 @@
    only to a few degrees. Note that the ADT7410 sits on the PCB and will read a
    few degrees above room temperature because of heat from the board and
    backlight. Plan for a fixed calibration offset (a constant to start with;
-   could be set over the API later).
+   could be set over the API later). *(Done: −8.2°C, from 29.2°C read in a
+   21.0°C room, as `TEMP_OFFSET_CENTI`. Readings stored before it were
+   adjusted once by bumping the log format to v2; see `migrate_v1` in
+   `src/templog.rs`.)*
 2. **Time.** Sampling every minute, the 10/5-minute screen timers, and
    "readings after a datetime" all need a clock. Plan:
    - Run the SAMD51 **RTC peripheral in 32-bit counter mode** at 1Hz as a
@@ -82,11 +85,12 @@
      also covers losing power halfway through a write.
 5. **Device→host API.** The serial protocol is currently one-way. Add a
    request/response command, e.g.
-   `{"readings":{"since":1760000000}}` → the device streams **one JSON object
-   per line** per reading, `{"t":1760000060,"c":21.43}` (epoch seconds, °C),
-   followed by a terminating `{"done":{"count":N}}` line. *(JSON confirmed.)*
-   Short keys keep each line to ~28 bytes, so a full year is ~15MB, which
-   takes up to about a minute over USB full-speed. That's acceptable for an
+   `{"readings":{"since":"2026-10-14T00:00:00Z"}}` → the device streams
+   **one JSON object per line** per reading,
+   `{"t":"2026-10-15T10:12:18Z","c":21.43}` (UTC ISO 8601, °C), followed by
+   a terminating `{"done":{"count":N}}` line. *(JSON confirmed; ISO 8601
+   rather than Unix time, changed after review.)* Lines are ~38 bytes, so a
+   full year is ~20MB, which takes roughly a minute over USB full-speed. That's acceptable for an
    occasional pull, and the CLI can request incrementally using `since`. The badge animation pauses while
    streaming. Writes from the main loop must handle `WouldBlock` (USB is
    serviced in the interrupt), so streaming is a small loop that retries
@@ -232,13 +236,29 @@ Each step builds, flashes, and is usable on its own.
   after, so the boot scan finds the head at the in-use → erased boundary.
   The 24h graph is refilled at the first time sync after boot.
 
-### Step 6 — Readings API + CLI
+### Step 6 — Readings API + CLI *(done)*
 - `{"readings":{"since":<epoch>}}` streaming JSON-lines response as
   described above.
 - CLI: `ppd-cli readings --since <datetime|duration>` printing the JSON lines
   (optionally converting `t` to local time); it parses the human-friendly time
   with `chrono`.
 - Update both READMEs (wire protocol, new commands, storage caveats).
+- As built: the log reads flash a 256-byte page (32 records) at a time and
+  finds the start by stepping back from the newest record. Serial writes
+  retry while the USB interrupts drain the buffer, giving up after 2s with
+  no progress. After a long reply, temperature sampling skips the missed
+  minutes rather than catching up. CLI output goes to stdout as JSON lines,
+  with the count on stderr.
+- Changed after review: the readings API uses ISO 8601 UTC date-times
+  instead of Unix time, both for `since` (`"2026-10-14T00:00:00Z"`, with
+  `YYYY-MM-DD[THH:MM[:SS]][Z]` accepted) and for each reading's `t`. UTC
+  rather than local, because the device only knows the current UTC offset,
+  which would be wrong for readings from before a daylight-saving change.
+  The conversion is in `src/datetime.rs`, checked against `chrono` on the
+  host. The CLI shows local time by default (`--utc` for the raw lines) and
+  accepts English for `--since` ("yesterday", "last monday", "3 days ago")
+  via the `interim` crate. `now`/`utc_offset` on other commands stay Unix
+  seconds.
 
 Why this order: Step 1 is what you asked for first and needs only I2C. Time
 (2) is a dependency of nearly everything else. Screens (3) and touch (4) are
