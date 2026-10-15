@@ -115,9 +115,10 @@ const GRAPH_LEFT: i32 = 34;
 const GRAPH_RIGHT_MARGIN: i32 = 6;
 const GRAPH_TOP: i32 = 96;
 const GRAPH_BOTTOM: i32 = 216;
-// Smallest temperature range the graph's y-axis spans, in centi-°C, so
-// sensor noise on a steady temperature doesn't fill the whole height.
-const GRAPH_MIN_RANGE: i32 = 200;
+// Smallest temperature range the graph's y-axis spans, in centi-°C (10°C),
+// centred on the readings, so small swings in a steady room stay small
+// rather than filling the whole height.
+const GRAPH_MIN_RANGE: i32 = 1000;
 
 // A press must read the same for this many consecutive frames to count, to
 // ride out contact bounce as a finger lands or lifts.
