@@ -119,7 +119,7 @@ bottom-right corner, or `--:--:--` until the clock has been set.
 
 The on-board ADT7410 sensor is read once a minute. The messages screen shows
 the latest reading small in the top-left corner. A second screen shows it
-large, with a graph of the last 24h below it (since boot only, for now).
+large, with a graph of the last 24h below it.
 
 The display switches between the two screens by itself:
 
@@ -154,6 +154,20 @@ For manual testing you can also just write a line to the serial port, e.g.:
 ```sh
 echo '{"text":{"msg":"hi"}}' > /dev/cu.usbmodem2101
 ```
+
+### Stored readings
+
+Once the clock has been set, each reading is also written to the board's
+8MB QSPI flash chip (the one CircuitPython used for its `CIRCUITPY` drive),
+as a ring of 8-byte records covering about 370 days, so older readings are
+overwritten. Readings taken before the clock is set after power-up aren't
+stored, since there's no time to store with them. The 24h graph is refilled
+from flash at the first time sync after boot, so it survives a restart.
+
+The first boot with this firmware, or after a change to the storage format,
+wipes the flash and shows "preparing storage (one-time)..." for several
+seconds. Anything else on the flash, such as an old CircuitPython
+filesystem, is lost. See `src/templog.rs` for the layout.
 
 ## Troubleshooting
 

@@ -76,8 +76,7 @@
      that still holds old data, erase it first. To meet "older than 1 year"
      exactly, queries also filter by timestamp, so slightly older data that is
      still physically present is never returned.
-   - Wear: each sector is erased about once per lap (~once a year), far within
-     NOR endurance.
+   - Wear: see "Flash wear" below.
    - On boot: scan for the write head (newest valid record). Records that
      are erased (`0xFF…`) or fail the CRC mark the end of the log, which
      also covers losing power halfway through a write.
@@ -101,6 +100,32 @@
    downsampled to the graph width (~300px → ~5 min per column, drawing the
    min–max range per column).
 8. **Units.** **°C** *(confirmed)*, displayed to one decimal place.
+
+## Flash wear
+
+Not a concern with this design:
+
+- **Which chip.** The log lives on the separate 8MB GD25Q64C QSPI chip, not
+  the microcontroller's internal flash (which holds the firmware). The
+  GD25Q64C is rated for at least 100,000 erase cycles per 4KB sector, with
+  ~20 years' data retention.
+- **Erases per sector.** Writing moves round the ring evenly, so wear is
+  spread across every sector. Each sector is erased twice per lap: once
+  when it becomes the sector kept erased ahead of the write position, and
+  once more when writing moves into it. A lap takes ~370 days at one reading
+  a minute, so that's ~2 erases per sector per year: 100,000 cycles would
+  last tens of thousands of years.
+- **Writes per record.** Each 8-byte record is programmed exactly once
+  between erases, never rewritten in place.
+- **Boot.** Nothing is written at boot: it only reads to find the end of
+  the log.
+- **Format.** The 4.2MB log area is only erased when the storage format
+  changes (one erase per sector each time), which is negligible.
+- **Internal flash.** The microcontroller's own flash is only written when
+  new firmware is flashed, so logging adds no wear there.
+
+For comparison, CircuitPython's FAT filesystem on the same chip rewrote the
+same few sectors on every file save, which wore it far more.
 
 ## Screen state machine (requirements 5–9)
 
@@ -189,7 +214,7 @@ Each step builds, flashes, and is usable on its own.
   (80ms), triggering on press rather than release. The `{"tap":{}}` command
   is kept for testing remotely.
 
-### Step 5 — Persistent storage (QSPI flash)
+### Step 5 — Persistent storage (QSPI flash) *(done)*
 - Spike first: bring up QSPI on the PyPortal (pin access outside the BSP;
   JEDEC ID read to confirm the GD25Q64). If the HAL's `qspi` module proves
   troublesome, fall back to bit-banged/regular SPI to the same chip.
@@ -198,6 +223,14 @@ Each step builds, flashes, and is usable on its own.
 - On boot, refill the 24h RAM ring from the log.
 - Reserve a header sector holding a magic number and format version, so a
   future format change can detect and reformat old data.
+- As built: the spike read JEDEC ID `C84017` (GD25Q64C) and a quad
+  erase/program/read round trip worked. The QSPI pins are taken by getting
+  the PORT back from the BSP (`unsafe fn port()`) and splitting it again.
+  Driver in `src/flash.rs`, log in `src/templog.rs`: header in block 0, log
+  in the next 65 blocks (1,040 sectors, ~370 days), records of u32 Unix time,
+  i16 centi-°C and CRC-16. Each move into a new sector erases it and the one
+  after, so the boot scan finds the head at the in-use → erased boundary.
+  The 24h graph is refilled at the first time sync after boot.
 
 ### Step 6 — Readings API + CLI
 - `{"readings":{"since":<epoch>}}` streaming JSON-lines response as

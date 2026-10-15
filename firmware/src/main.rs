@@ -1,6 +1,9 @@
 #![no_std]
 #![no_main]
 
+mod flash;
+mod templog;
+
 use pyportal as bsp;
 
 use bsp::hal;
@@ -278,6 +281,15 @@ impl History {
         self.next = (self.next + 1) % HISTORY_LEN;
     }
 
+    /// Stores a reading `age` samples older than the newest one, unless
+    /// that slot already holds one. Used to fill in from the flash log.
+    fn fill_if_empty(&mut self, age: usize, centi_c: i16) {
+        let slot = &mut self.samples[(self.next + HISTORY_LEN - 1 - age) % HISTORY_LEN];
+        if slot.is_none() {
+            *slot = Some(centi_c);
+        }
+    }
+
     /// Sample `i` counting from the oldest (0) to the newest
     /// (HISTORY_LEN - 1).
     fn get(&self, i: usize) -> Option<i16> {
@@ -439,7 +451,14 @@ fn main() -> ! {
         &mut peripherals.nvmctrl,
     );
 
-    let pins = bsp::Pins::new(peripherals.port).split();
+    let mut bsp_pins = bsp::Pins::new(peripherals.port);
+    // The BSP has no names for the QSPI flash pins, so it drops them. Take
+    // the PORT back and split it again to get at just those six. `unsafe`
+    // because two `Pins` sets now exist; it's sound because the BSP's set
+    // doesn't contain any of these six, so each pin still has one owner,
+    // and every other pin in this second set is dropped unused.
+    let qspi_pins = hal::gpio::Pins::new(unsafe { bsp_pins.port() });
+    let pins = bsp_pins.split();
     let mut delay = Delay::new(core.SYST, &mut clocks);
 
     let mut red_led: bsp::RedLed = pin_alias!(pins.red_led).into();
@@ -489,6 +508,25 @@ fn main() -> ! {
     } else {
         None
     };
+    let flash = flash::Flash::new(
+        &mut peripherals.mclk,
+        peripherals.qspi,
+        qspi_pins.pb10,
+        qspi_pins.pb11,
+        qspi_pins.pa08,
+        qspi_pins.pa09,
+        qspi_pins.pa10,
+        qspi_pins.pa11,
+    );
+    let mut log = templog::TempLog::open(flash, || {
+        let _ = Text::new(
+            "preparing storage (one-time)...",
+            Point::new(10, 140),
+            small_style,
+        )
+        .draw(&mut disp);
+    });
+
     let mut history = History::new();
     history.push(temperature);
 
@@ -564,6 +602,10 @@ fn main() -> ! {
     // The local time the clock last drew, to the second; None forces a
     // redraw, needed after anything that draws over its corner.
     let mut shown_clock: Option<Option<i64>> = None;
+    // Whether the 24h history has been filled in from the flash log. That
+    // waits for the first time sync, since placing logged readings on the
+    // graph needs the current time.
+    let mut history_loaded = false;
 
     loop {
         let uptime = clock.uptime_secs();
@@ -604,6 +646,19 @@ fn main() -> ! {
                 None => {}
             }
             red_led.set_low().unwrap();
+        }
+
+        if !history_loaded {
+            if let Some(now) = clock.now() {
+                history_loaded = true;
+                if let Some(log) = log.as_mut() {
+                    load_history(log, &mut history, now);
+                    if screen == Screen::Temp {
+                        draw_temp_readings(&mut disp, &layout, temperature, &history);
+                        shown_clock = None;
+                    }
+                }
+            }
         }
 
         if touch.poll() {
@@ -648,6 +703,12 @@ fn main() -> ! {
                 None
             };
             history.push(temperature);
+            // Only logged once the clock is set: without it there's no
+            // timestamp to store.
+            if let (Some(log), Some(centi_c), Some(now)) = (log.as_mut(), temperature, clock.now())
+            {
+                log.append(now as u32, centi_c);
+            }
             match screen {
                 Screen::Messages => draw_temperature(&mut disp, temperature, temp_style),
                 Screen::Temp => {
@@ -688,6 +749,19 @@ fn main() -> ! {
 
         delay.delay_ms(FRAME_DELAY_MS);
     }
+}
+
+/// Fills the 24h history's gaps with readings from the flash log, placing
+/// each by its age relative to `now`.
+fn load_history(log: &mut templog::TempLog, history: &mut History, now: i64) {
+    log.for_each_newest_first(|unix_time, centi_c| {
+        let age = (now - unix_time as i64).max(0) as u64 / TEMP_SAMPLE_INTERVAL_S;
+        if age >= HISTORY_LEN as u64 {
+            return false;
+        }
+        history.fill_if_empty(age as usize, centi_c);
+        true
+    });
 }
 
 /// Redraws the whole messages screen from the last `text`/`badge` command's
