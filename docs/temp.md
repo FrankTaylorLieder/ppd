@@ -153,12 +153,12 @@ Each step builds, flashes, and is usable on its own.
 - Doing this before the screens means Steps 3 and 5 can use real
   seconds for their timers.
 - As built: the CLI also sends `utc_offset` (seconds east of UTC) so the
-  device can show local time. A temporary debug clock (bottom-right) shows
-  the device's local time, to be removed in Step 3. `LINE_CAPACITY` was
+  device can show local time. A debug clock (bottom-right) shows the device's
+  local time; it was kept in Step 3 as part of the display. `LINE_CAPACITY` was
   raised from 256 to 512 bytes, since the time fields add ~36 bytes to every
   command.
 
-### Step 3 — Temperature screen and screen switching
+### Step 3 — Temperature screen and screen switching *(done)*
 - Keep the last message command (copy the raw line, ≤256 bytes, and re-parse
   it to redraw). This is the "remember what was on screen" change described
   above.
@@ -173,11 +173,21 @@ Each step builds, flashes, and is usable on its own.
   Temp; ≥5 min on Temp + update → Messages), using a stub tap source for
   now. For testing, a debug serial command such as `{"screen":"temp"}` can
   stand in for taps.
+- As built: the stand-in is `{"tap":{}}`, which acts exactly like a tap. The
+  big reading uses `u8g2_font_logisoso58_tf` from the `u8g2-fonts` crate. The
+  clock from Step 2 is kept as a permanent feature rather than removed as
+  first planned: HH:MM:SS bottom-right on both screens, standing in for a
+  "now" label at the graph's right-hand end. The graph draws each pixel column as a bar
+  from the min to the max of the ~5 samples it covers.
 
-### Step 4 — Touch input
+### Step 4 — Touch input *(done)*
 - Resistive touch read via the ADC: drive one axis, sample the other to
   detect contact. Debounce, emit one tap per press→release.
 - Wire it into the state machine.
+- As built: no ADC needed. XL is held low and YU has the internal pull-up,
+  so a press reads as YU going low. A press counts once stable for 2 frames
+  (80ms), triggering on press rather than release. The `{"tap":{}}` command
+  is kept for testing remotely.
 
 ### Step 5 — Persistent storage (QSPI flash)
 - Spike first: bring up QSPI on the PyPortal (pin access outside the BSP;

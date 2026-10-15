@@ -112,9 +112,31 @@ the last time it was sent. It forgets the time on every power cycle. The
 RTC runs from an internal oscillator and will drift, so the CLI sends `now`
 with every command. The temperature is read once a minute either way.
 
-For now, the device's own idea of the local time is drawn small and gray in
-the bottom-right corner (`--:--:--` until it's been set), as a temporary
-check that the clock works.
+Both screens show the device's local time (HH:MM:SS) small and gray in the
+bottom-right corner, or `--:--:--` until the clock has been set.
+
+### Temperature screen
+
+The on-board ADT7410 sensor is read once a minute. The messages screen shows
+the latest reading small in the top-left corner. A second screen shows it
+large, with a graph of the last 24h below it (since boot only, for now).
+
+The display switches between the two screens by itself:
+
+- After 10 minutes with no `text`/`badge` command, it shows the temperature
+  screen.
+- On the temperature screen, a new message switches back to the messages
+  screen, but only once the temperature screen has been up for at least
+  5 minutes. Before that, the message is stored and shown on the next switch
+  back.
+
+Tapping the screen anywhere switches between the two (and restarts the
+10-minute timer when switching back to messages). This command does the same,
+for testing without touching it:
+
+```json
+{"tap":{}}
+```
 
 Use `../cli` rather than crafting this by hand — it auto-detects the port by
 VID:PID and handles the framing:
@@ -124,6 +146,7 @@ ppd-cli text "Hello, world!"
 ppd-cli badge 3 --message "Alice: hi" --message "Bob: meeting at 3"
 ppd-cli badge 0
 ppd-cli sync-time
+ppd-cli tap
 ```
 
 For manual testing you can also just write a line to the serial port, e.g.:

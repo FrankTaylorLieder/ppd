@@ -37,6 +37,8 @@ use heapless::{String as HString, Vec as HVec};
 use micromath::F32Ext;
 use serde::Deserialize;
 use static_cell::StaticCell;
+use u8g2_fonts::types::{FontColor, HorizontalAlignment, VerticalPosition};
+use u8g2_fonts::{fonts, FontRenderer};
 
 use panic_halt as _;
 
@@ -84,6 +86,32 @@ const ADT7410_CONFIG_16BIT: u8 = 0x80;
 const ADT7410_FIRST_CONVERSION_MS: u16 = 250;
 
 const TEMP_SAMPLE_INTERVAL_S: u64 = 60;
+// The temperature screen graphs this many of the most recent samples (24h).
+const HISTORY_LEN: usize = (24 * 60 * 60 / TEMP_SAMPLE_INTERVAL_S) as usize;
+
+// Screen switching: show the temperature after this long with no message
+// update, and only leave it for a new message once it's been up this long.
+const IDLE_TO_TEMP_S: u64 = 10 * 60;
+const MIN_TEMP_SCREEN_S: u64 = 5 * 60;
+
+// Temperature screen layout. The big reading sits above the graph; the
+// graph's labels sit to its left and below it, with the clock bottom-right.
+const BIG_TEMP_TOP: i32 = 16;
+// Cap height of `u8g2_font_logisoso58_tf`, so the digits' baseline sits
+// this far below BIG_TEMP_TOP.
+const BIG_TEMP_CAP_H: i32 = 58;
+const BIG_TEMP_AREA_H: u32 = 72;
+const GRAPH_LEFT: i32 = 34;
+const GRAPH_RIGHT_MARGIN: i32 = 6;
+const GRAPH_TOP: i32 = 96;
+const GRAPH_BOTTOM: i32 = 216;
+// Smallest temperature range the graph's y-axis spans, in centi-°C, so
+// sensor noise on a steady temperature doesn't fill the whole height.
+const GRAPH_MIN_RANGE: i32 = 200;
+
+// A press must read the same for this many consecutive frames to count, to
+// ride out contact bounce as a finger lands or lifts.
+const TOUCH_DEBOUNCE_FRAMES: u8 = 2;
 
 // `with_internal_32kosc` routes the internal ultra-low-power oscillator's
 // 1.024kHz output to the RTC, which counts it with no prescaler.
@@ -174,6 +202,149 @@ enum Command<'a> {
         #[serde(default)]
         utc_offset: Option<i32>,
     },
+    /// Acts as if the screen had been tapped: switches between the messages
+    /// and temperature screens. Useful for testing without touching it.
+    Tap {},
+}
+
+/// What a received line asks the main loop to do. Extracted from `Command`
+/// so the line it borrows from can then be kept (as the last message).
+enum Event {
+    /// A `text` or `badge` command, carrying optional clock sync.
+    Message {
+        now: Option<i64>,
+        utc_offset: Option<i32>,
+    },
+    Time {
+        now: i64,
+        utc_offset: Option<i32>,
+    },
+    Tap,
+}
+
+fn parse_command(line: &[u8]) -> Option<Command<'_>> {
+    let text = core::str::from_utf8(line).ok()?;
+    serde_json_core::from_str::<Command>(text)
+        .ok()
+        .map(|(cmd, _)| cmd)
+}
+
+fn parse_event(line: &[u8]) -> Option<Event> {
+    Some(match parse_command(line)? {
+        Command::Text {
+            now, utc_offset, ..
+        }
+        | Command::Badge {
+            now, utc_offset, ..
+        } => Event::Message { now, utc_offset },
+        Command::Time { now, utc_offset } => Event::Time { now, utc_offset },
+        Command::Tap {} => Event::Tap,
+    })
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Screen {
+    Messages,
+    Temp,
+}
+
+impl Screen {
+    /// The screen a tap switches to.
+    fn other(self) -> Self {
+        match self {
+            Screen::Messages => Screen::Temp,
+            Screen::Temp => Screen::Messages,
+        }
+    }
+}
+
+/// The last 24h of readings, one per sample interval, oldest overwritten
+/// first. Only covers time since boot; earlier slots are None.
+struct History {
+    samples: [Option<i16>; HISTORY_LEN],
+    next: usize,
+}
+
+impl History {
+    fn new() -> Self {
+        History {
+            samples: [None; HISTORY_LEN],
+            next: 0,
+        }
+    }
+
+    fn push(&mut self, centi_c: Option<i16>) {
+        self.samples[self.next] = centi_c;
+        self.next = (self.next + 1) % HISTORY_LEN;
+    }
+
+    /// Sample `i` counting from the oldest (0) to the newest
+    /// (HISTORY_LEN - 1).
+    fn get(&self, i: usize) -> Option<i16> {
+        self.samples[(self.next + i) % HISTORY_LEN]
+    }
+}
+
+/// Detects presses on the resistive touchscreen, without working out where.
+///
+/// XL (one end of the X layer) is held low and YU (one end of the Y layer)
+/// is pulled up by the chip's internal pull-up; the other two pins are left
+/// floating. Untouched, the layers don't connect and YU reads high. Pressed,
+/// the layers touch and YU is pulled low through the X layer, whose few
+/// hundred ohms easily overpower the ~40k pull-up. That's a plain digital
+/// read, so no ADC is needed.
+struct Touch {
+    // Only held to keep it driven low.
+    _xl: hal::gpio::Pin<hal::gpio::PB01, hal::gpio::PushPullOutput>,
+    yu: hal::gpio::Pin<hal::gpio::PA06, hal::gpio::PullUpInput>,
+    /// Debounced state.
+    pressed: bool,
+    /// Consecutive frames the raw reading has disagreed with `pressed`.
+    changing_frames: u8,
+}
+
+impl Touch {
+    fn new(touchscreen: bsp::Touchscreen) -> Self {
+        let mut xl = touchscreen.xl.into_push_pull_output();
+        let _ = xl.set_low();
+        Touch {
+            _xl: xl,
+            yu: touchscreen.yu.into_pull_up_input(),
+            pressed: false,
+            changing_frames: 0,
+        }
+    }
+
+    /// Call once per frame. Returns true on the frame a new press is
+    /// confirmed; holding the press doesn't repeat it.
+    fn poll(&mut self) -> bool {
+        let raw_pressed = self.yu.is_low().unwrap_or(false);
+        if raw_pressed == self.pressed {
+            self.changing_frames = 0;
+            return false;
+        }
+        self.changing_frames += 1;
+        if self.changing_frames < TOUCH_DEBOUNCE_FRAMES {
+            return false;
+        }
+        self.pressed = raw_pressed;
+        self.changing_frames = 0;
+        self.pressed
+    }
+}
+
+/// Fixed screen geometry and text styles, shared by the drawing functions.
+struct Layout {
+    size: Size,
+    cx: i32,
+    cy: i32,
+    badge_area: Rectangle,
+    /// Preview lines start just below the badge area.
+    badge_bottom: i32,
+    style: MonoTextStyle<'static, Rgb565>,
+    small_style: MonoTextStyle<'static, Rgb565>,
+    gray_style: MonoTextStyle<'static, Rgb565>,
+    temp_style: MonoTextStyle<'static, Rgb565>,
 }
 
 /// Seconds since boot, from the RTC, plus the wall-clock time once the host
@@ -231,8 +402,9 @@ impl Clock {
 enum Mode {
     /// Nothing animating; whatever was last drawn stays on screen as-is.
     Static,
-    /// Notification badge, redrawn with a wobble each frame.
-    Animated,
+    /// Notification badge showing this count, redrawn with a wobble each
+    /// frame.
+    Animated(u32),
 }
 
 // `static mut`: BADGE_BUF is only ever touched from `main`'s own
@@ -271,6 +443,7 @@ fn main() -> ! {
     let mut delay = Delay::new(core.SYST, &mut clocks);
 
     let mut red_led: bsp::RedLed = pin_alias!(pins.red_led).into();
+    let mut touch = Touch::new(pins.touchscreen);
 
     let (mut disp, backlight, _tft_te) = pins.display.init(
         DisplaySize240x320,
@@ -288,11 +461,9 @@ fn main() -> ! {
     let gray_style = MonoTextStyle::new(&FONT_6X10, gray);
     let temp_style = MonoTextStyle::new(&FONT_10X20, gray);
 
+    // Blank the panel while the sensor and USB come up; the messages screen
+    // is drawn once that's done.
     disp.clear(Rgb565::BLACK).unwrap();
-    Text::new("waiting for message...", Point::new(10, 100), style)
-        .draw(&mut disp)
-        .unwrap();
-    let mut mode = Mode::Static;
 
     // `count32_mode` alone leaves COUNT read-synchronization off, in which
     // case the SAMD51 doesn't guarantee reads of the counter are correct;
@@ -318,7 +489,8 @@ fn main() -> ! {
     } else {
         None
     };
-    draw_temperature(&mut disp, temperature, temp_style);
+    let mut history = History::new();
+    history.push(temperature);
 
     let bus_allocator = USB_ALLOCATOR.init(bsp::usb_allocator(
         pins.usb.usb_dm,
@@ -362,89 +534,111 @@ fn main() -> ! {
     // once before the loop below (which never returns) starts using it.
     let badge_buf: &mut BadgeBuf = unsafe { BADGE_BUF.write(BadgeBuf::new()) };
     let badge_top = cy - 110;
-    let badge_area = Rectangle::new(
-        Point::new(cx - (BADGE_W / 2) as i32, badge_top),
-        Size::new(BADGE_W as u32, BADGE_H as u32),
-    );
-    // Preview lines start just below the badge area.
-    let badge_bottom = badge_top + BADGE_H as i32;
+    let layout = Layout {
+        size,
+        cx,
+        cy,
+        badge_area: Rectangle::new(
+            Point::new(cx - (BADGE_W / 2) as i32, badge_top),
+            Size::new(BADGE_W as u32, BADGE_H as u32),
+        ),
+        badge_bottom: badge_top + BADGE_H as i32,
+        style,
+        small_style,
+        gray_style,
+        temp_style,
+    };
 
-    let mut badge_count: u32 = 0;
+    // The raw line of the last `text`/`badge` command, re-parsed to redraw
+    // the messages screen when switching back to it.
+    let mut last_message: Option<HVec<u8, LINE_CAPACITY>> = None;
+    let mut screen = Screen::Messages;
+    let mut mode = draw_messages_screen(&mut disp, &layout, None, temperature);
+    // Uptime of the last message update (or tap back to the messages
+    // screen), and of when the temperature screen was last shown.
+    let mut last_message_secs: u64 = 0;
+    let mut temp_since_secs: u64 = 0;
+
     let mut tick: u32 = 0;
     let mut next_sample_secs = TEMP_SAMPLE_INTERVAL_S;
-    // What the debug clock last drew; None forces a redraw.
+    // The local time the clock last drew, to the second; None forces a
+    // redraw, needed after anything that draws over its corner.
     let mut shown_clock: Option<Option<i64>> = None;
 
     loop {
-        let line = cortex_m::interrupt::free(|cs| PENDING_LINE.borrow(cs).borrow_mut().take());
+        let uptime = clock.uptime_secs();
+        let mut switch_to: Option<Screen> = None;
 
+        let line = cortex_m::interrupt::free(|cs| PENDING_LINE.borrow(cs).borrow_mut().take());
         if let Some(line) = line {
             red_led.set_high().unwrap();
-            if let Ok(text) = core::str::from_utf8(&line) {
-                if let Ok((cmd, _)) = serde_json_core::from_str::<Command>(text) {
-                    match cmd {
-                        Command::Text {
-                            msg,
-                            updated_at,
-                            now,
-                            utc_offset,
-                        } => {
-                            if let Some(now) = now {
-                                clock.sync(now, utc_offset);
-                            }
-                            disp.clear(Rgb565::BLACK).unwrap();
-                            Text::new(msg, Point::new(10, 100), style)
-                                .draw(&mut disp)
-                                .unwrap();
-                            draw_timestamp(&mut disp, size, updated_at, gray_style);
-                            mode = Mode::Static;
+            match parse_event(&line) {
+                Some(Event::Message { now, utc_offset }) => {
+                    if let Some(now) = now {
+                        clock.sync(now, utc_offset);
+                    }
+                    last_message = Some(line);
+                    last_message_secs = uptime;
+                    match screen {
+                        Screen::Messages => {
+                            mode = draw_messages_screen(
+                                &mut disp,
+                                &layout,
+                                last_message.as_deref(),
+                                temperature,
+                            );
+                            tick = 0;
+                            shown_clock = None;
                         }
-                        Command::Badge {
-                            count,
-                            messages,
-                            updated_at,
-                            now,
-                            utc_offset,
-                        } => {
-                            if let Some(now) = now {
-                                clock.sync(now, utc_offset);
-                            }
-                            disp.clear(Rgb565::BLACK).unwrap();
-                            if count == 0 {
-                                draw_sleep_icon(&mut disp, cx, cy, style);
-                                mode = Mode::Static;
-                            } else {
-                                // Fill the remaining screen space with as many preview
-                                // lines as fit, ignoring any beyond that.
-                                let mut y = badge_bottom + 15;
-                                let bottom_limit = size.height as i32 - PREVIEW_BOTTOM_MARGIN;
-                                for m in messages.iter() {
-                                    if y + FONT_6X10.character_size.height as i32 > bottom_limit {
-                                        break;
-                                    }
-                                    Text::new(m, Point::new(10, y), small_style)
-                                        .draw(&mut disp)
-                                        .unwrap();
-                                    y += PREVIEW_LINE_PITCH;
-                                }
-                                badge_count = count;
-                                tick = 0;
-                                mode = Mode::Animated;
-                            }
-                            draw_timestamp(&mut disp, size, updated_at, gray_style);
+                        // Only leave the temperature screen if it's been up
+                        // a while; otherwise the message waits until the
+                        // next switch back.
+                        Screen::Temp if uptime - temp_since_secs >= MIN_TEMP_SCREEN_S => {
+                            switch_to = Some(Screen::Messages);
                         }
-                        Command::Time { now, utc_offset } => clock.sync(now, utc_offset),
+                        Screen::Temp => {}
                     }
                 }
+                Some(Event::Time { now, utc_offset }) => clock.sync(now, utc_offset),
+                Some(Event::Tap) => switch_to = Some(screen.other()),
+                None => {}
             }
-            // `text`/`badge` clear the screen, so put the temperature and
-            // clock back. Harmless after `time`, which doesn't.
-            draw_temperature(&mut disp, temperature, temp_style);
-            shown_clock = None;
             red_led.set_low().unwrap();
         }
 
-        if clock.uptime_secs() >= next_sample_secs {
+        if touch.poll() {
+            switch_to = Some(screen.other());
+        }
+
+        if screen == Screen::Messages && uptime - last_message_secs >= IDLE_TO_TEMP_S {
+            switch_to = Some(Screen::Temp);
+        }
+
+        if let Some(next) = switch_to {
+            screen = next;
+            match next {
+                Screen::Messages => {
+                    // Restart the idle timer, or a tap back after a long
+                    // idle would bounce straight back to the temperature.
+                    last_message_secs = uptime;
+                    mode = draw_messages_screen(
+                        &mut disp,
+                        &layout,
+                        last_message.as_deref(),
+                        temperature,
+                    );
+                    tick = 0;
+                }
+                Screen::Temp => {
+                    temp_since_secs = uptime;
+                    disp.clear(Rgb565::BLACK).unwrap();
+                    draw_temp_readings(&mut disp, &layout, temperature, &history);
+                }
+            }
+            shown_clock = None;
+        }
+
+        if uptime >= next_sample_secs {
             next_sample_secs += TEMP_SAMPLE_INTERVAL_S;
             // Retry the init each time if the sensor wasn't found at boot, so
             // a transient I2C failure doesn't leave it blank until reset.
@@ -453,37 +647,239 @@ fn main() -> ! {
             } else {
                 None
             };
-            draw_temperature(&mut disp, temperature, temp_style);
+            history.push(temperature);
+            match screen {
+                Screen::Messages => draw_temperature(&mut disp, temperature, temp_style),
+                Screen::Temp => {
+                    draw_temp_readings(&mut disp, &layout, temperature, &history);
+                    shown_clock = None;
+                }
+            }
         }
 
-        // Debug clock: redraw only when the displayed second changes.
+        // Redraw the clock only when the displayed second changes.
         let local_now = clock.now().map(|t| t + clock.utc_offset as i64);
         if shown_clock != Some(local_now) {
-            draw_debug_clock(&mut disp, size, local_now, gray_style);
+            draw_clock(&mut disp, size, local_now, gray_style);
             shown_clock = Some(local_now);
         }
 
-        if let Mode::Animated = mode {
-            // Compose the badge into an off-screen buffer, then push it
-            // to the panel in a single contiguous transfer. This avoids
-            // both the on-glass black-then-red flash of clear+draw, and
-            // the visible "wipe" of drawing a circle pixel-by-pixel
-            // directly over the bus.
-            badge_buf.clear_to_black();
-            draw_notification(
-                badge_buf,
-                (BADGE_W / 2) as i32,
-                (BADGE_H / 2) as i32,
-                tick,
-                badge_count,
-                style,
-            );
-            disp.fill_contiguous(&badge_area, badge_buf.pixels.iter().copied())
-                .unwrap();
-            tick = tick.wrapping_add(1);
+        if screen == Screen::Messages {
+            if let Mode::Animated(count) = mode {
+                // Compose the badge into an off-screen buffer, then push
+                // it to the panel in a single contiguous transfer. This
+                // avoids both the on-glass black-then-red flash of
+                // clear+draw, and the visible "wipe" of drawing a circle
+                // pixel-by-pixel directly over the bus.
+                badge_buf.clear_to_black();
+                draw_notification(
+                    badge_buf,
+                    (BADGE_W / 2) as i32,
+                    (BADGE_H / 2) as i32,
+                    tick,
+                    count,
+                    style,
+                );
+                disp.fill_contiguous(&layout.badge_area, badge_buf.pixels.iter().copied())
+                    .unwrap();
+                tick = tick.wrapping_add(1);
+            }
         }
 
         delay.delay_ms(FRAME_DELAY_MS);
+    }
+}
+
+/// Redraws the whole messages screen from the last `text`/`badge` command's
+/// raw line, or the boot placeholder if there hasn't been one yet. Returns
+/// whether the badge needs animating.
+fn draw_messages_screen<D>(
+    disp: &mut D,
+    layout: &Layout,
+    last_message: Option<&[u8]>,
+    temperature: Option<i16>,
+) -> Mode
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    let _ = disp.clear(Rgb565::BLACK);
+    let mode = match last_message.and_then(parse_command) {
+        Some(Command::Text {
+            msg, updated_at, ..
+        }) => {
+            let _ = Text::new(msg, Point::new(10, 100), layout.style).draw(disp);
+            draw_timestamp(disp, layout.size, updated_at, layout.gray_style);
+            Mode::Static
+        }
+        Some(Command::Badge {
+            count,
+            messages,
+            updated_at,
+            ..
+        }) => {
+            let mode = if count == 0 {
+                draw_sleep_icon(disp, layout.cx, layout.cy, layout.style);
+                Mode::Static
+            } else {
+                // Fill the remaining screen space with as many preview
+                // lines as fit, ignoring any beyond that.
+                let mut y = layout.badge_bottom + 15;
+                let bottom_limit = layout.size.height as i32 - PREVIEW_BOTTOM_MARGIN;
+                for m in messages.iter() {
+                    if y + FONT_6X10.character_size.height as i32 > bottom_limit {
+                        break;
+                    }
+                    let _ = Text::new(m, Point::new(10, y), layout.small_style).draw(disp);
+                    y += PREVIEW_LINE_PITCH;
+                }
+                Mode::Animated(count)
+            };
+            draw_timestamp(disp, layout.size, updated_at, layout.gray_style);
+            mode
+        }
+        _ => {
+            let _ =
+                Text::new("waiting for message...", Point::new(10, 100), layout.style).draw(disp);
+            Mode::Static
+        }
+    };
+    draw_temperature(disp, temperature, layout.temp_style);
+    mode
+}
+
+/// Draws the temperature screen's changing parts, the big current reading and
+/// the 24h graph, clearing each area first so it can be redrawn in place.
+fn draw_temp_readings<D>(disp: &mut D, layout: &Layout, temperature: Option<i16>, history: &History)
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    let width = layout.size.width as i32;
+    let black = PrimitiveStyle::with_fill(Rgb565::BLACK);
+
+    // Big current reading.
+    let _ = Rectangle::new(
+        Point::new(0, BIG_TEMP_TOP - 2),
+        Size::new(layout.size.width, BIG_TEMP_AREA_H),
+    )
+    .into_styled(black)
+    .draw(disp);
+    let mut text: HString<12> = HString::new();
+    match temperature {
+        Some(c) => {
+            let _ = write!(text, "{:.1}°C", c as f32 / 100.0);
+        }
+        None => {
+            let _ = text.push_str("--.-°C");
+        }
+    }
+    let _ = FontRenderer::new::<fonts::u8g2_font_logisoso58_tf>().render_aligned(
+        text.as_str(),
+        // Positioned by baseline: `Top` would align to the font's tallest
+        // glyph (accented capitals), not the digits.
+        Point::new(layout.cx, BIG_TEMP_TOP + BIG_TEMP_CAP_H),
+        VerticalPosition::Baseline,
+        HorizontalAlignment::Center,
+        FontColor::Transparent(Rgb565::WHITE),
+        disp,
+    );
+
+    // Graph area, including its labels.
+    let _ = Rectangle::new(
+        Point::new(0, GRAPH_TOP - 8),
+        Size::new(
+            layout.size.width,
+            layout.size.height - (GRAPH_TOP - 8) as u32,
+        ),
+    )
+    .into_styled(black)
+    .draw(disp);
+
+    let graph_right = width - GRAPH_RIGHT_MARGIN;
+    let graph_w = graph_right - GRAPH_LEFT;
+    let graph_h = GRAPH_BOTTOM - GRAPH_TOP;
+    let _ = Rectangle::new(
+        Point::new(GRAPH_LEFT - 1, GRAPH_TOP - 1),
+        Size::new(graph_w as u32 + 2, graph_h as u32 + 2),
+    )
+    .into_styled(PrimitiveStyle::with_stroke(Rgb565::new(6, 12, 6), 1))
+    .draw(disp);
+
+    let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
+    let right_aligned = TextStyleBuilder::new().alignment(Alignment::Right).build();
+    let label_y = GRAPH_BOTTOM + 14;
+    let _ = Text::with_text_style(
+        "-24h",
+        Point::new(GRAPH_LEFT, label_y),
+        layout.gray_style,
+        centered,
+    )
+    .draw(disp);
+    let _ = Text::with_text_style(
+        "-12h",
+        Point::new(GRAPH_LEFT + graph_w / 2, label_y),
+        layout.gray_style,
+        centered,
+    )
+    .draw(disp);
+    // No "now" label at the right end: the clock sits there instead.
+
+    let valid = || {
+        (0..HISTORY_LEN)
+            .filter_map(|i| history.get(i))
+            .map(i32::from)
+    };
+    let (Some(mut lo), Some(mut hi)) = (valid().min(), valid().max()) else {
+        let _ = Text::with_text_style(
+            "no readings yet",
+            Point::new(GRAPH_LEFT + graph_w / 2, GRAPH_TOP + graph_h / 2),
+            layout.gray_style,
+            centered,
+        )
+        .draw(disp);
+        return;
+    };
+    if hi - lo < GRAPH_MIN_RANGE {
+        let mid = (hi + lo) / 2;
+        lo = mid - GRAPH_MIN_RANGE / 2;
+        hi = lo + GRAPH_MIN_RANGE;
+    }
+
+    let mut label: HString<8> = HString::new();
+    let _ = write!(label, "{:.1}", hi as f32 / 100.0);
+    let _ = Text::with_text_style(
+        &label,
+        Point::new(GRAPH_LEFT - 4, GRAPH_TOP + 8),
+        layout.gray_style,
+        right_aligned,
+    )
+    .draw(disp);
+    label.clear();
+    let _ = write!(label, "{:.1}", lo as f32 / 100.0);
+    let _ = Text::with_text_style(
+        &label,
+        Point::new(GRAPH_LEFT - 4, GRAPH_BOTTOM),
+        layout.gray_style,
+        right_aligned,
+    )
+    .draw(disp);
+
+    // One pixel column per group of samples, drawn as a bar spanning that
+    // group's min..max so short spikes aren't lost to downsampling.
+    let to_y = |c: i32| GRAPH_BOTTOM - 1 - (c - lo) * (graph_h - 1) / (hi - lo);
+    let line = PrimitiveStyle::with_fill(Rgb565::new(31, 40, 0));
+    for col in 0..graph_w {
+        let start = col as usize * HISTORY_LEN / graph_w as usize;
+        let end = (col as usize + 1) * HISTORY_LEN / graph_w as usize;
+        let group = || (start..end).filter_map(|i| history.get(i)).map(i32::from);
+        if let (Some(min), Some(max)) = (group().min(), group().max()) {
+            let top = to_y(max);
+            let _ = Rectangle::new(
+                Point::new(GRAPH_LEFT + col, top),
+                Size::new(1, (to_y(min) - top + 1) as u32),
+            )
+            .into_styled(line)
+            .draw(disp);
+        }
     }
 }
 
@@ -541,16 +937,12 @@ where
     .draw(disp);
 }
 
-/// Temporary: draws the device's own idea of the local time (HH:MM:SS) in
-/// the bottom-right corner, or "--:--:--" before the host has sent it, so
-/// the RTC can be checked against the host's clock. To be removed once the
-/// temperature screen uses the clock.
-fn draw_debug_clock<D>(
-    disp: &mut D,
-    size: Size,
-    local_secs: Option<i64>,
-    style: MonoTextStyle<Rgb565>,
-) where
+/// Draws the local time (HH:MM:SS) small in the bottom-right corner, given
+/// seconds since the Unix epoch in local time, or "--:--:--" before the host
+/// has sent the time. Shown on both screens; on the temperature screen it
+/// also marks the right-hand ("now") end of the graph.
+fn draw_clock<D>(disp: &mut D, size: Size, local_secs: Option<i64>, style: MonoTextStyle<Rgb565>)
+where
     D: DrawTarget<Color = Rgb565>,
 {
     let w = size.width as i32;

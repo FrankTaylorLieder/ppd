@@ -41,6 +41,9 @@ enum Command {
     /// Set the device's clock to this machine's time without changing
     /// what's on screen (every other command also does this)
     SyncTime,
+    /// Switch between the messages and temperature screens, as a tap on the
+    /// screen would
+    Tap,
     /// List candidate serial ports
     List,
 }
@@ -62,6 +65,7 @@ enum Message<'a> {
         time: TimeSync,
     },
     Time(TimeSync),
+    Tap {},
 }
 
 /// Keeps the device's clock in step with this machine's: Unix time (UTC),
@@ -159,6 +163,7 @@ fn main() -> Result<()> {
             )?
         }
         Command::SyncTime => send(&mut *port, &Message::Time(time))?,
+        Command::Tap => send(&mut *port, &Message::Tap {})?,
         Command::List => unreachable!(),
     }
 
