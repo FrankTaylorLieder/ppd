@@ -11,6 +11,7 @@ use hal::delay::Delay;
 use hal::ehal::i2c::I2c as EhalI2c;
 use hal::pac::{interrupt, CorePeripherals, Peripherals};
 use hal::prelude::*;
+use hal::rtc::{Count32Mode, Rtc};
 use hal::usb::UsbBus;
 
 use usb_device::bus::UsbBusAllocator;
@@ -39,7 +40,7 @@ use static_cell::StaticCell;
 
 use panic_halt as _;
 
-const LINE_CAPACITY: usize = 256;
+const LINE_CAPACITY: usize = 512;
 // Wire-protocol cap on how many preview messages a command may carry. This is
 // deliberately larger than what the screen can show at once (see
 // `PREVIEW_LINE_PITCH` / the space check in the render loop below) — extras
@@ -82,10 +83,11 @@ const ADT7410_CONFIG_16BIT: u8 = 0x80;
 // before the first read so it isn't stale.
 const ADT7410_FIRST_CONVERSION_MS: u16 = 250;
 
-// Approximately once a minute, by counting main-loop iterations. Each
-// iteration takes FRAME_DELAY_MS plus however long rendering took, so this
-// runs somewhat slow; it's a stopgap until the RTC provides real seconds.
-const TEMP_SAMPLE_FRAMES: u32 = 60_000 / FRAME_DELAY_MS as u32;
+const TEMP_SAMPLE_INTERVAL_S: u64 = 60;
+
+// `with_internal_32kosc` routes the internal ultra-low-power oscillator's
+// 1.024kHz output to the RTC, which counts it with no prescaler.
+const RTC_HZ: u32 = 1024;
 
 struct BadgeBuf {
     pixels: [Rgb565; BADGE_W * BADGE_H],
@@ -141,6 +143,10 @@ enum Command<'a> {
         /// string; empty (the default) draws nothing.
         #[serde(default)]
         updated_at: &'a str,
+        #[serde(default)]
+        now: Option<i64>,
+        #[serde(default)]
+        utc_offset: Option<i32>,
     },
     /// Show the "N waiting" badge animation with a small preview of
     /// messages below it. A count of 0 shows a static "nothing to do" icon
@@ -152,7 +158,74 @@ enum Command<'a> {
         messages: HVec<&'a str, MAX_PREVIEW_MESSAGES>,
         #[serde(default)]
         updated_at: &'a str,
+        #[serde(default)]
+        now: Option<i64>,
+        #[serde(default)]
+        utc_offset: Option<i32>,
     },
+    /// Set the device clock without changing what's on screen. `text` and
+    /// `badge` take the same optional `now`/`utc_offset` fields, so a host
+    /// that sends those regularly never needs this.
+    Time {
+        /// Current Unix time, in seconds.
+        now: i64,
+        /// Local time's offset from UTC in seconds (e.g. 3600 for UTC+1),
+        /// used only for displaying local time. Readings are kept in UTC.
+        #[serde(default)]
+        utc_offset: Option<i32>,
+    },
+}
+
+/// Seconds since boot, from the RTC, plus the wall-clock time once the host
+/// has told us what it is. There's no battery, so the wall-clock time is
+/// lost on every power cycle until the host sends it again.
+struct Clock {
+    rtc: Rtc<Count32Mode>,
+    // The 32-bit counter wraps after ~48 days at 1024Hz, so it's extended to
+    // 64 bits here. `ticks` must be called more often than that, which the
+    // main loop does every frame.
+    last_count: u32,
+    total_ticks: u64,
+    /// Unix time at uptime zero, once synced.
+    boot_epoch: Option<i64>,
+    utc_offset: i32,
+}
+
+impl Clock {
+    fn new(rtc: Rtc<Count32Mode>) -> Self {
+        let last_count = rtc.count32();
+        Clock {
+            rtc,
+            last_count,
+            total_ticks: 0,
+            boot_epoch: None,
+            utc_offset: 0,
+        }
+    }
+
+    fn ticks(&mut self) -> u64 {
+        let count = self.rtc.count32();
+        self.total_ticks += count.wrapping_sub(self.last_count) as u64;
+        self.last_count = count;
+        self.total_ticks
+    }
+
+    fn uptime_secs(&mut self) -> u64 {
+        self.ticks() / RTC_HZ as u64
+    }
+
+    fn sync(&mut self, now: i64, utc_offset: Option<i32>) {
+        self.boot_epoch = Some(now - self.uptime_secs() as i64);
+        if let Some(offset) = utc_offset {
+            self.utc_offset = offset;
+        }
+    }
+
+    /// Current Unix time, or None if the host hasn't sent it since boot.
+    fn now(&mut self) -> Option<i64> {
+        let uptime = self.uptime_secs() as i64;
+        self.boot_epoch.map(|boot| boot + uptime)
+    }
 }
 
 enum Mode {
@@ -220,6 +293,13 @@ fn main() -> ! {
         .draw(&mut disp)
         .unwrap();
     let mut mode = Mode::Static;
+
+    // `count32_mode` alone leaves COUNT read-synchronization off, in which
+    // case the SAMD51 doesn't guarantee reads of the counter are correct;
+    // `into_count32_mode` turns it on.
+    let rtc =
+        Rtc::count32_mode(peripherals.rtc, RTC_HZ.Hz(), &mut peripherals.mclk).into_count32_mode();
+    let mut clock = Clock::new(rtc);
 
     let mut i2c = bsp::i2c_master(
         &mut clocks,
@@ -291,7 +371,9 @@ fn main() -> ! {
 
     let mut badge_count: u32 = 0;
     let mut tick: u32 = 0;
-    let mut frames_since_sample: u32 = 0;
+    let mut next_sample_secs = TEMP_SAMPLE_INTERVAL_S;
+    // What the debug clock last drew; None forces a redraw.
+    let mut shown_clock: Option<Option<i64>> = None;
 
     loop {
         let line = cortex_m::interrupt::free(|cs| PENDING_LINE.borrow(cs).borrow_mut().take());
@@ -301,7 +383,15 @@ fn main() -> ! {
             if let Ok(text) = core::str::from_utf8(&line) {
                 if let Ok((cmd, _)) = serde_json_core::from_str::<Command>(text) {
                     match cmd {
-                        Command::Text { msg, updated_at } => {
+                        Command::Text {
+                            msg,
+                            updated_at,
+                            now,
+                            utc_offset,
+                        } => {
+                            if let Some(now) = now {
+                                clock.sync(now, utc_offset);
+                            }
                             disp.clear(Rgb565::BLACK).unwrap();
                             Text::new(msg, Point::new(10, 100), style)
                                 .draw(&mut disp)
@@ -313,7 +403,12 @@ fn main() -> ! {
                             count,
                             messages,
                             updated_at,
+                            now,
+                            utc_offset,
                         } => {
+                            if let Some(now) = now {
+                                clock.sync(now, utc_offset);
+                            }
                             disp.clear(Rgb565::BLACK).unwrap();
                             if count == 0 {
                                 draw_sleep_icon(&mut disp, cx, cy, style);
@@ -338,17 +433,19 @@ fn main() -> ! {
                             }
                             draw_timestamp(&mut disp, size, updated_at, gray_style);
                         }
+                        Command::Time { now, utc_offset } => clock.sync(now, utc_offset),
                     }
                 }
             }
-            // Every command clears the screen, so put the temperature back.
+            // `text`/`badge` clear the screen, so put the temperature and
+            // clock back. Harmless after `time`, which doesn't.
             draw_temperature(&mut disp, temperature, temp_style);
+            shown_clock = None;
             red_led.set_low().unwrap();
         }
 
-        frames_since_sample += 1;
-        if frames_since_sample >= TEMP_SAMPLE_FRAMES {
-            frames_since_sample = 0;
+        if clock.uptime_secs() >= next_sample_secs {
+            next_sample_secs += TEMP_SAMPLE_INTERVAL_S;
             // Retry the init each time if the sensor wasn't found at boot, so
             // a transient I2C failure doesn't leave it blank until reset.
             temperature = if sensor_ok || adt7410_init(&mut i2c) {
@@ -357,6 +454,13 @@ fn main() -> ! {
                 None
             };
             draw_temperature(&mut disp, temperature, temp_style);
+        }
+
+        // Debug clock: redraw only when the displayed second changes.
+        let local_now = clock.now().map(|t| t + clock.utc_offset as i64);
+        if shown_clock != Some(local_now) {
+            draw_debug_clock(&mut disp, size, local_now, gray_style);
+            shown_clock = Some(local_now);
         }
 
         if let Mode::Animated = mode {
@@ -431,6 +535,54 @@ where
     let _ = Text::with_text_style(
         text,
         Point::new(size.width as i32 - 4, 12),
+        style,
+        right_aligned,
+    )
+    .draw(disp);
+}
+
+/// Temporary: draws the device's own idea of the local time (HH:MM:SS) in
+/// the bottom-right corner, or "--:--:--" before the host has sent it, so
+/// the RTC can be checked against the host's clock. To be removed once the
+/// temperature screen uses the clock.
+fn draw_debug_clock<D>(
+    disp: &mut D,
+    size: Size,
+    local_secs: Option<i64>,
+    style: MonoTextStyle<Rgb565>,
+) where
+    D: DrawTarget<Color = Rgb565>,
+{
+    let w = size.width as i32;
+    let h = size.height as i32;
+    // Room for "HH:MM:SS" in FONT_6X10, below the last preview line.
+    let _ = Rectangle::new(Point::new(w - 54, h - 14), Size::new(54, 14))
+        .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
+        .draw(disp);
+
+    let mut text: HString<8> = HString::new();
+    match local_secs {
+        Some(t) => {
+            let day_secs = t.rem_euclid(86_400);
+            let _ = write!(
+                text,
+                "{:02}:{:02}:{:02}",
+                day_secs / 3600,
+                day_secs / 60 % 60,
+                day_secs % 60
+            );
+        }
+        None => {
+            let _ = text.push_str("--:--:--");
+        }
+    }
+    let right_aligned = TextStyleBuilder::new()
+        .alignment(Alignment::Right)
+        .baseline(Baseline::Bottom)
+        .build();
+    let _ = Text::with_text_style(
+        text.as_str(),
+        Point::new(w - 4, h - 3),
         style,
         right_aligned,
     )

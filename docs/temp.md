@@ -125,7 +125,7 @@ Details:
 
 Each step builds, flashes, and is usable on its own.
 
-### Step 1 — Read the ADT7410 and show it on the messages screen
+### Step 1 — Read the ADT7410 and show it on the messages screen *(done)*
 - Set up SERCOM5 as I2C master on PB02/PB03 (the `I2cSercom` alias already
   exists in the BSP) at 100–400kHz.
 - Minimal ADT7410 driver (a few functions in `main.rs`, or a small `temp`
@@ -144,7 +144,7 @@ Each step builds, flashes, and is usable on its own.
   badge area (x≈90–230) or the message text.
 - If the sensor doesn't respond, show `--.-C` rather than panicking.
 
-### Step 2 — Proper timekeeping
+### Step 2 — Proper timekeeping *(done)*
 - RTC in counter mode as the monotonic clock. Swap the loop-counter timing
   from Step 1 for "sample when `rtc_seconds` crosses the next minute".
 - Optional `now` field on `text`/`badge`, plus a standalone `time` command.
@@ -152,6 +152,11 @@ Each step builds, flashes, and is usable on its own.
   subcommand.
 - Doing this before the screens means Steps 3 and 5 can use real
   seconds for their timers.
+- As built: the CLI also sends `utc_offset` (seconds east of UTC) so the
+  device can show local time. A temporary debug clock (bottom-right) shows
+  the device's local time, to be removed in Step 3. `LINE_CAPACITY` was
+  raised from 256 to 512 bytes, since the time fields add ~36 bytes to every
+  command.
 
 ### Step 3 — Temperature screen and screen switching
 - Keep the last message command (copy the raw line, ≤256 bytes, and re-parse

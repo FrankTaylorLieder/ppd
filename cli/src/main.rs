@@ -38,6 +38,9 @@ enum Command {
         #[arg(long = "message", value_name = "MESSAGE")]
         messages: Vec<String>,
     },
+    /// Set the device's clock to this machine's time without changing
+    /// what's on screen (every other command also does this)
+    SyncTime,
     /// List candidate serial ports
     List,
 }
@@ -48,12 +51,25 @@ enum Message<'a> {
     Text {
         msg: &'a str,
         updated_at: &'a str,
+        #[serde(flatten)]
+        time: TimeSync,
     },
     Badge {
         count: u32,
         messages: &'a [&'a str],
         updated_at: &'a str,
+        #[serde(flatten)]
+        time: TimeSync,
     },
+    Time(TimeSync),
+}
+
+/// Keeps the device's clock in step with this machine's: Unix time (UTC),
+/// plus the local offset from UTC so it can display local time.
+#[derive(serde::Serialize)]
+struct TimeSync {
+    now: i64,
+    utc_offset: i32,
 }
 
 fn find_port() -> Result<String> {
@@ -108,7 +124,12 @@ fn main() -> Result<()> {
         .open()
         .with_context(|| format!("opening {port_name}"))?;
 
-    let updated_at = chrono::Local::now().format("%H:%M:%S").to_string();
+    let local_now = chrono::Local::now();
+    let updated_at = local_now.format("%H:%M:%S").to_string();
+    let time = TimeSync {
+        now: local_now.timestamp(),
+        utc_offset: local_now.offset().local_minus_utc(),
+    };
 
     match cli.command {
         Command::Text { message } => send(
@@ -116,6 +137,7 @@ fn main() -> Result<()> {
             &Message::Text {
                 msg: &message,
                 updated_at: &updated_at,
+                time,
             },
         )?,
         Command::Badge { count, messages } => {
@@ -132,9 +154,11 @@ fn main() -> Result<()> {
                     count,
                     messages: &refs,
                     updated_at: &updated_at,
+                    time,
                 },
             )?
         }
+        Command::SyncTime => send(&mut *port, &Message::Time(time))?,
         Command::List => unreachable!(),
     }
 

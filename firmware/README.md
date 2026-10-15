@@ -91,9 +91,30 @@ command fail to parse and get silently dropped. A `count` of `0` shows a
 static "nothing to do" icon instead of the animation, ignoring `messages`.
 
 Both commands also take an optional `updated_at` string, drawn small and
-gray in the top-right corner (e.g. `"14:32:05"`). The firmware has no
-real-time clock, so this is opaque display text supplied by the caller, not
-something it computes itself; omitting it (or sending `""`) draws nothing.
+gray in the top-right corner (e.g. `"14:32:05"`). This is opaque display
+text supplied by the caller, not something the firmware computes itself;
+omitting it (or sending `""`) draws nothing.
+
+### Setting the clock
+
+The board has no battery-backed clock, so the host tells it the time. Both
+commands above also take optional `now` (Unix time in seconds, UTC) and
+`utc_offset` (local offset from UTC in seconds, e.g. `3600` for UTC+1, used
+only to display local time) fields. To set the clock without changing the
+screen:
+
+```json
+{"time":{"now":1760000000,"utc_offset":3600}}
+```
+
+The device counts seconds since boot itself, using its RTC, and adds them to
+the last time it was sent. It forgets the time on every power cycle. The
+RTC runs from an internal oscillator and will drift, so the CLI sends `now`
+with every command. The temperature is read once a minute either way.
+
+For now, the device's own idea of the local time is drawn small and gray in
+the bottom-right corner (`--:--:--` until it's been set), as a temporary
+check that the clock works.
 
 Use `../cli` rather than crafting this by hand — it auto-detects the port by
 VID:PID and handles the framing:
@@ -102,6 +123,7 @@ VID:PID and handles the framing:
 ppd-cli text "Hello, world!"
 ppd-cli badge 3 --message "Alice: hi" --message "Bob: meeting at 3"
 ppd-cli badge 0
+ppd-cli sync-time
 ```
 
 For manual testing you can also just write a line to the serial port, e.g.:
@@ -119,5 +141,5 @@ echo '{"text":{"msg":"hi"}}' > /dev/cu.usbmodem2101
   the `cli` crate to see what the OS actually sees; on macOS both a
   `/dev/cu.*` and `/dev/tty.*` node show up for the same device, which is
   expected.
-- **Garbled or ignored messages**: the firmware's line buffer is 256 bytes
+- **Garbled or ignored messages**: the firmware's line buffer is 512 bytes
   (`LINE_CAPACITY` in `src/main.rs`); longer lines are silently dropped.
