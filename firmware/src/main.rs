@@ -8,6 +8,7 @@ use bsp::{entry, pin_alias, DisplaySize240x320, Orientation};
 
 use hal::clock::GenericClockController;
 use hal::delay::Delay;
+use hal::ehal::i2c::I2c as EhalI2c;
 use hal::pac::{interrupt, CorePeripherals, Peripherals};
 use hal::prelude::*;
 use hal::usb::UsbBus;
@@ -28,7 +29,7 @@ use embedded_graphics::mono_font::MonoTextStyle;
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::{Circle, PrimitiveStyle, Rectangle};
-use embedded_graphics::text::{Alignment, Text, TextStyleBuilder};
+use embedded_graphics::text::{Alignment, Baseline, Text, TextStyleBuilder};
 use embedded_graphics::Pixel;
 
 use heapless::{String as HString, Vec as HVec};
@@ -64,6 +65,27 @@ const BADGE_DIAMETER: u32 = 56;
 // real-time speed, since `tick` (and so the animation phase) advances once
 // per loop iteration regardless of mode.
 const FRAME_DELAY_MS: u16 = 40;
+
+// On-board ADT7410 temperature sensor, on the BSP's I2C pins.
+const ADT7410_ADDR: u8 = 0x48;
+const ADT7410_REG_TEMP: u8 = 0x00;
+const ADT7410_REG_CONFIG: u8 = 0x03;
+const ADT7410_REG_ID: u8 = 0x0B;
+// Upper 5 bits of the ID register are the fixed manufacturer ID; the low 3
+// are a silicon revision we don't care about.
+const ADT7410_ID_MASK: u8 = 0xF8;
+const ADT7410_ID: u8 = 0xC8;
+// Config register value selecting 16-bit resolution (1/128 °C per LSB),
+// continuous conversion.
+const ADT7410_CONFIG_16BIT: u8 = 0x80;
+// A 16-bit conversion takes up to 240ms; wait this long after configuring
+// before the first read so it isn't stale.
+const ADT7410_FIRST_CONVERSION_MS: u16 = 250;
+
+// Approximately once a minute, by counting main-loop iterations. Each
+// iteration takes FRAME_DELAY_MS plus however long rendering took, so this
+// runs somewhat slow; it's a stopgap until the RTC provides real seconds.
+const TEMP_SAMPLE_FRAMES: u32 = 60_000 / FRAME_DELAY_MS as u32;
 
 struct BadgeBuf {
     pixels: [Rgb565; BADGE_W * BADGE_H],
@@ -189,13 +211,34 @@ fn main() -> ! {
     let cy = size.height as i32 / 2;
     let style = MonoTextStyle::new(&FONT_10X20, Rgb565::WHITE);
     let small_style = MonoTextStyle::new(&FONT_6X10, Rgb565::WHITE);
-    let gray_style = MonoTextStyle::new(&FONT_6X10, Rgb565::new(18, 36, 18));
+    let gray = Rgb565::new(18, 36, 18);
+    let gray_style = MonoTextStyle::new(&FONT_6X10, gray);
+    let temp_style = MonoTextStyle::new(&FONT_10X20, gray);
 
     disp.clear(Rgb565::BLACK).unwrap();
     Text::new("waiting for message...", Point::new(10, 100), style)
         .draw(&mut disp)
         .unwrap();
     let mut mode = Mode::Static;
+
+    let mut i2c = bsp::i2c_master(
+        &mut clocks,
+        100.kHz(),
+        peripherals.sercom5,
+        &mut peripherals.mclk,
+        pins.i2c.sda,
+        pins.i2c.scl,
+    );
+    let sensor_ok = adt7410_init(&mut i2c);
+    if sensor_ok {
+        delay.delay_ms(ADT7410_FIRST_CONVERSION_MS);
+    }
+    let mut temperature = if sensor_ok {
+        adt7410_read(&mut i2c)
+    } else {
+        None
+    };
+    draw_temperature(&mut disp, temperature, temp_style);
 
     let bus_allocator = USB_ALLOCATOR.init(bsp::usb_allocator(
         pins.usb.usb_dm,
@@ -248,6 +291,7 @@ fn main() -> ! {
 
     let mut badge_count: u32 = 0;
     let mut tick: u32 = 0;
+    let mut frames_since_sample: u32 = 0;
 
     loop {
         let line = cortex_m::interrupt::free(|cs| PENDING_LINE.borrow(cs).borrow_mut().take());
@@ -297,7 +341,22 @@ fn main() -> ! {
                     }
                 }
             }
+            // Every command clears the screen, so put the temperature back.
+            draw_temperature(&mut disp, temperature, temp_style);
             red_led.set_low().unwrap();
+        }
+
+        frames_since_sample += 1;
+        if frames_since_sample >= TEMP_SAMPLE_FRAMES {
+            frames_since_sample = 0;
+            // Retry the init each time if the sensor wasn't found at boot, so
+            // a transient I2C failure doesn't leave it blank until reset.
+            temperature = if sensor_ok || adt7410_init(&mut i2c) {
+                adt7410_read(&mut i2c)
+            } else {
+                None
+            };
+            draw_temperature(&mut disp, temperature, temp_style);
         }
 
         if let Mode::Animated = mode {
@@ -376,6 +435,59 @@ where
         right_aligned,
     )
     .draw(disp);
+}
+
+/// Confirms an ADT7410 is present and switches it to 16-bit mode. Returns
+/// false if it doesn't respond or isn't the expected part.
+fn adt7410_init(i2c: &mut bsp::I2c) -> bool {
+    let mut id = [0u8; 1];
+    // Fully qualified: `hal::prelude` also brings the embedded-hal 0.2 I2C
+    // traits into scope, which have methods of the same names.
+    if EhalI2c::write_read(i2c, ADT7410_ADDR, &[ADT7410_REG_ID], &mut id).is_err()
+        || id[0] & ADT7410_ID_MASK != ADT7410_ID
+    {
+        return false;
+    }
+    EhalI2c::write(
+        i2c,
+        ADT7410_ADDR,
+        &[ADT7410_REG_CONFIG, ADT7410_CONFIG_16BIT],
+    )
+    .is_ok()
+}
+
+/// Latest reading in hundredths of a degree Celsius, or None on I2C error.
+fn adt7410_read(i2c: &mut bsp::I2c) -> Option<i16> {
+    let mut raw = [0u8; 2];
+    EhalI2c::write_read(i2c, ADT7410_ADDR, &[ADT7410_REG_TEMP], &mut raw).ok()?;
+    // 16-bit two's complement, 1/128 °C per LSB.
+    let raw = i16::from_be_bytes(raw) as i32;
+    Some((raw * 100 / 128) as i16)
+}
+
+/// Draws the temperature in the top-left corner, opposite `draw_timestamp`
+/// on the right. Clears its own area first so it can be
+/// updated without redrawing the rest of the screen.
+fn draw_temperature<D>(disp: &mut D, centi_c: Option<i16>, style: MonoTextStyle<Rgb565>)
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    // Sized for FONT_10X20 and the longest plausible reading, e.g. "-40.0C".
+    // Stays clear of the badge area, which starts at x=90.
+    let _ = Rectangle::new(Point::new(0, 0), Size::new(66, 24))
+        .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
+        .draw(disp);
+
+    let mut text: HString<8> = HString::new();
+    match centi_c {
+        Some(c) => {
+            let _ = write!(text, "{:.1}C", c as f32 / 100.0);
+        }
+        None => {
+            let _ = text.push_str("--.-C");
+        }
+    }
+    let _ = Text::with_baseline(text.as_str(), Point::new(4, 2), style, Baseline::Top).draw(disp);
 }
 
 fn draw_sleep_icon<D>(disp: &mut D, cx: i32, cy: i32, style: MonoTextStyle<Rgb565>)
