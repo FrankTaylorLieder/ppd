@@ -121,9 +121,11 @@ The on-board ADT7410 sensor is read once a minute, with a fixed calibration
 offset (`TEMP_OFFSET_CENTI` in `src/main.rs`, currently −8.2°C) for the
 heat of the board and backlight around it. The messages screen shows
 the latest reading small in the top-left corner. A second screen shows it
-large, with a graph of the last 24h below it. The graph's scale always
+large, with the last 24h's maximum and minimum in smaller gray text to its
+right and a graph of the last 24h below it. The graph's scale always
 spans at least 10°C, centred on the readings, so small swings in a steady
-room look small.
+room look small. Dim guide lines mark each hour back from now and each whole
+degree (every 2°C or 5°C instead if the range is wide enough to crowd them).
 
 The display switches between the two screens by itself:
 

@@ -104,13 +104,18 @@ const HISTORY_LEN: usize = (24 * 60 * 60 / TEMP_SAMPLE_INTERVAL_S) as usize;
 const IDLE_TO_TEMP_S: u64 = 10 * 60;
 const MIN_TEMP_SCREEN_S: u64 = 5 * 60;
 
-// Temperature screen layout. The big reading sits above the graph; the
-// graph's labels sit to its left and below it, with the clock bottom-right.
-const BIG_TEMP_TOP: i32 = 16;
-// Cap height of `u8g2_font_logisoso58_tf`, so the digits' baseline sits
-// this far below BIG_TEMP_TOP.
-const BIG_TEMP_CAP_H: i32 = 58;
-const BIG_TEMP_AREA_H: u32 = 72;
+// Temperature screen layout. The big reading sits above the graph,
+// left-aligned, with the 24h max and min to its right; the graph's labels
+// sit to its left and below it, with the clock bottom-right.
+//
+// In `u8g2_font_logisoso58_tf` the digits are 58px tall and "°" rises to
+// 66px above the baseline. Its glyphs start ~4px right of the draw point,
+// so the ink lines up with the 10px left margin used elsewhere.
+const BIG_TEMP_BASELINE: i32 = 74;
+const BIG_TEMP_ASCENT: i32 = 66;
+const BIG_TEMP_LEFT: i32 = 6;
+// The min line shares the big reading's baseline; max sits this far above.
+const MIN_MAX_PITCH: i32 = 28;
 const GRAPH_LEFT: i32 = 34;
 const GRAPH_RIGHT_MARGIN: i32 = 6;
 const GRAPH_TOP: i32 = 96;
@@ -119,6 +124,11 @@ const GRAPH_BOTTOM: i32 = 216;
 // centred on the readings, so small swings in a steady room stay small
 // rather than filling the whole height.
 const GRAPH_MIN_RANGE: i32 = 1000;
+// Guide lines behind the data: one per hour back from now, and one per
+// whole degree, widened to 2°C or 5°C if lines would be under 6px apart.
+const GRAPH_GRID_COLOR: Rgb565 = Rgb565::new(4, 8, 4);
+const GRAPH_GRID_STEPS: [i32; 3] = [100, 200, 500];
+const GRAPH_GRID_MIN_SPACING: i32 = 6;
 
 // A press must read the same for this many consecutive frames to count, to
 // ride out contact bounce as a finger lands or lifts.
@@ -412,6 +422,7 @@ struct Layout {
     small_style: MonoTextStyle<'static, Rgb565>,
     gray_style: MonoTextStyle<'static, Rgb565>,
     temp_style: MonoTextStyle<'static, Rgb565>,
+    gray: Rgb565,
 }
 
 /// Seconds since boot, from the RTC, plus the wall-clock time once the host
@@ -645,6 +656,7 @@ fn main() -> ! {
         small_style,
         gray_style,
         temp_style,
+        gray,
     };
 
     // The raw line of the last `text`/`badge` command, re-parsed to redraw
@@ -924,11 +936,19 @@ where
 {
     let width = layout.size.width as i32;
     let black = PrimitiveStyle::with_fill(Rgb565::BLACK);
+    let graph_right = width - GRAPH_RIGHT_MARGIN;
 
-    // Big current reading.
+    let valid = || {
+        (0..HISTORY_LEN)
+            .filter_map(|i| history.get(i))
+            .map(i32::from)
+    };
+    let min_max = valid().min().zip(valid().max());
+
+    // Big current reading, with the 24h max and min to its right.
     let _ = Rectangle::new(
-        Point::new(0, BIG_TEMP_TOP - 2),
-        Size::new(layout.size.width, BIG_TEMP_AREA_H),
+        Point::new(0, BIG_TEMP_BASELINE - BIG_TEMP_ASCENT - 1),
+        Size::new(layout.size.width, BIG_TEMP_ASCENT as u32 + 3),
     )
     .into_styled(black)
     .draw(disp);
@@ -945,12 +965,33 @@ where
         text.as_str(),
         // Positioned by baseline: `Top` would align to the font's tallest
         // glyph (accented capitals), not the digits.
-        Point::new(layout.cx, BIG_TEMP_TOP + BIG_TEMP_CAP_H),
+        Point::new(BIG_TEMP_LEFT, BIG_TEMP_BASELINE),
         VerticalPosition::Baseline,
-        HorizontalAlignment::Center,
+        HorizontalAlignment::Left,
         FontColor::Transparent(Rgb565::WHITE),
         disp,
     );
+    // Right-aligned with the graph. "max 21.6°C" is ~100px wide, leaving a
+    // gap of ~20px after a typical big reading (~190px); only a reading of
+    // -10°C or below would be wide enough to run into it.
+    if let Some((min, max)) = min_max {
+        let small = FontRenderer::new::<fonts::u8g2_font_logisoso16_tf>();
+        for (label, centi_c, baseline) in [
+            ("max", max, BIG_TEMP_BASELINE - MIN_MAX_PITCH),
+            ("min", min, BIG_TEMP_BASELINE),
+        ] {
+            let mut line: HString<16> = HString::new();
+            let _ = write!(line, "{label} {:.1}°C", centi_c as f32 / 100.0);
+            let _ = small.render_aligned(
+                line.as_str(),
+                Point::new(graph_right, baseline),
+                VerticalPosition::Baseline,
+                HorizontalAlignment::Right,
+                FontColor::Transparent(layout.gray),
+                disp,
+            );
+        }
+    }
 
     // Graph area, including its labels.
     let _ = Rectangle::new(
@@ -963,7 +1004,6 @@ where
     .into_styled(black)
     .draw(disp);
 
-    let graph_right = width - GRAPH_RIGHT_MARGIN;
     let graph_w = graph_right - GRAPH_LEFT;
     let graph_h = GRAPH_BOTTOM - GRAPH_TOP;
     let _ = Rectangle::new(
@@ -992,12 +1032,18 @@ where
     .draw(disp);
     // No "now" label at the right end: the clock sits there instead.
 
-    let valid = || {
-        (0..HISTORY_LEN)
-            .filter_map(|i| history.get(i))
-            .map(i32::from)
-    };
-    let (Some(mut lo), Some(mut hi)) = (valid().min(), valid().max()) else {
+    let grid = PrimitiveStyle::with_fill(GRAPH_GRID_COLOR);
+    let hours = (HISTORY_LEN as u64 * TEMP_SAMPLE_INTERVAL_S / 3600) as i32;
+    for hour in 1..hours {
+        let _ = Rectangle::new(
+            Point::new(GRAPH_LEFT + graph_w * hour / hours, GRAPH_TOP),
+            Size::new(1, graph_h as u32),
+        )
+        .into_styled(grid)
+        .draw(disp);
+    }
+
+    let Some((mut lo, mut hi)) = min_max else {
         let _ = Text::with_text_style(
             "no readings yet",
             Point::new(GRAPH_LEFT + graph_w / 2, GRAPH_TOP + graph_h / 2),
@@ -1032,9 +1078,26 @@ where
     )
     .draw(disp);
 
+    let to_y = |c: i32| GRAPH_BOTTOM - 1 - (c - lo) * (graph_h - 1) / (hi - lo);
+
+    let step = GRAPH_GRID_STEPS
+        .into_iter()
+        .find(|&step| step * (graph_h - 1) / (hi - lo) >= GRAPH_GRID_MIN_SPACING)
+        .unwrap_or(GRAPH_GRID_STEPS[GRAPH_GRID_STEPS.len() - 1]);
+    let mut degree = (lo + step - 1).div_euclid(step) * step;
+    while degree <= hi {
+        let y = to_y(degree);
+        // Skip lines that would sit on the frame.
+        if y > GRAPH_TOP && y < GRAPH_BOTTOM - 1 {
+            let _ = Rectangle::new(Point::new(GRAPH_LEFT, y), Size::new(graph_w as u32, 1))
+                .into_styled(grid)
+                .draw(disp);
+        }
+        degree += step;
+    }
+
     // One pixel column per group of samples, drawn as a bar spanning that
     // group's min..max so short spikes aren't lost to downsampling.
-    let to_y = |c: i32| GRAPH_BOTTOM - 1 - (c - lo) * (graph_h - 1) / (hi - lo);
     let line = PrimitiveStyle::with_fill(Rgb565::new(31, 40, 0));
     for col in 0..graph_w {
         let start = col as usize * HISTORY_LEN / graph_w as usize;
