@@ -125,7 +125,8 @@ large, with the last 24h's maximum and minimum in smaller gray text to its
 right and a graph of the last 24h below it. The graph's scale always
 spans at least 10°C, centred on the readings, so small swings in a steady
 room look small. Dim guide lines mark each hour back from now and each whole
-degree (every 2°C or 5°C instead if the range is wide enough to crowd them).
+degree (every 2°C or 5°C instead if the range is wide enough to crowd them). A gray line
+marks the current reading across the graph, labelled on the y-axis.
 
 The display switches between the two screens by itself:
 

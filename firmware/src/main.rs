@@ -1019,7 +1019,6 @@ where
     .draw(disp);
 
     let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
-    let right_aligned = TextStyleBuilder::new().alignment(Alignment::Right).build();
     let label_y = GRAPH_BOTTOM + 14;
     let _ = Text::with_text_style(
         "-24h",
@@ -1064,26 +1063,42 @@ where
         hi = lo + GRAPH_MIN_RANGE;
     }
 
-    let mut label: HString<8> = HString::new();
-    let _ = write!(label, "{:.1}", hi as f32 / 100.0);
-    let _ = Text::with_text_style(
-        &label,
-        Point::new(GRAPH_LEFT - 4, GRAPH_TOP + 8),
-        layout.gray_style,
-        right_aligned,
-    )
-    .draw(disp);
-    label.clear();
-    let _ = write!(label, "{:.1}", lo as f32 / 100.0);
-    let _ = Text::with_text_style(
-        &label,
-        Point::new(GRAPH_LEFT - 4, GRAPH_BOTTOM),
-        layout.gray_style,
-        right_aligned,
-    )
-    .draw(disp);
-
     let to_y = |c: i32| GRAPH_BOTTOM - 1 - (c - lo) * (graph_h - 1) / (hi - lo);
+    let current_y = temperature.map(|c| to_y(c as i32));
+
+    // Axis labels: the scale's top and bottom, and the current reading
+    // beside its line (drawn last, below). FONT_6X10 is
+    // 10px tall, so an end label that would overlap the current one by
+    // being within this distance of it is left out.
+    const LABEL_CLEARANCE: i32 = 12;
+    let axis_label = |disp: &mut D, centi_c: i32, position: Point, style, baseline| {
+        let mut label: HString<8> = HString::new();
+        let _ = write!(label, "{:.1}", centi_c as f32 / 100.0);
+        let text_style = TextStyleBuilder::new()
+            .alignment(Alignment::Right)
+            .baseline(baseline)
+            .build();
+        let _ = Text::with_text_style(&label, position, style, text_style).draw(disp);
+    };
+    let clear_of_current = |y: i32| current_y.map_or(true, |cy| (cy - y).abs() >= LABEL_CLEARANCE);
+    if clear_of_current(GRAPH_TOP + 4) {
+        axis_label(
+            disp,
+            hi,
+            Point::new(GRAPH_LEFT - 4, GRAPH_TOP),
+            layout.gray_style,
+            Baseline::Top,
+        );
+    }
+    if clear_of_current(GRAPH_BOTTOM - 4) {
+        axis_label(
+            disp,
+            lo,
+            Point::new(GRAPH_LEFT - 4, GRAPH_BOTTOM),
+            layout.gray_style,
+            Baseline::Bottom,
+        );
+    }
 
     let step = GRAPH_GRID_STEPS
         .into_iter()
@@ -1099,6 +1114,14 @@ where
                 .draw(disp);
         }
         degree += step;
+    }
+
+    // The current reading, from "now" back to the y-axis: above the grid,
+    // below the data.
+    if let Some(y) = current_y {
+        let _ = Rectangle::new(Point::new(GRAPH_LEFT, y), Size::new(graph_w as u32, 1))
+            .into_styled(PrimitiveStyle::with_fill(layout.gray))
+            .draw(disp);
     }
 
     // One pixel column per group of samples, drawn as a bar spanning that
@@ -1117,6 +1140,16 @@ where
             .into_styled(line)
             .draw(disp);
         }
+    }
+
+    if let (Some(centi_c), Some(y)) = (temperature, current_y) {
+        axis_label(
+            disp,
+            centi_c as i32,
+            Point::new(GRAPH_LEFT - 4, y),
+            layout.gray_style,
+            Baseline::Middle,
+        );
     }
 }
 
