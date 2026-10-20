@@ -127,11 +127,14 @@ room look small.
 
 The display switches between the two screens by itself:
 
-- After 10 minutes with no `text`/`badge` command, it shows the temperature
+- After 10 minutes with no `text`/`badge` command that has something to
+  show (a `badge` with count 0 doesn't count), it shows the temperature
   screen.
 - On the temperature screen, a new message switches back to the messages
   screen, but only once the temperature screen has been up for at least
-  5 minutes. Before that, the message is stored and shown on the next switch
+  5 minutes, and only if there's something to show: a `text`, or a `badge`
+  with a count of 1 or more. A `badge` with count 0 ("nothing to do") never
+  switches back. Otherwise the update is stored and shown on the next switch
   back.
 
 Tapping the screen anywhere switches between the two (and restarts the

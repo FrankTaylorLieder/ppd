@@ -137,8 +137,8 @@ same few sectors on every file save, which wore it far more.
             tap                                  tap
 Messages ─────────────▶ Temp           Temp ─────────────▶ Messages
 Messages ── 10 min since last msg update ──▶ Temp
-Temp (on it ≥ 5 min) ── msg update ──▶ Messages
-Temp (on it < 5 min) ── msg update ──▶ stay on Temp; store message for later
+Temp (on it ≥ 5 min) ── msg update with messages ──▶ Messages
+Temp (on it < 5 min, or update has no messages) ── msg update ──▶ stay on Temp; store it for later
 ```
 
 Details:
@@ -149,6 +149,12 @@ Details:
   update", including one identical to the last. No de-duplication: while the
   host keeps sending, the display stays on Messages.
 - Time-sync and `readings` requests are *not* message updates.
+- *(Added after review.)* Leaving the temperature screen also needs the
+  update to have something to show: any `text`, or a `badge` with count ≥ 1.
+  A `badge` with count 0 stays on the temperature screen, however long it's
+  been up. It also doesn't restart the 10-minute idle timer, so "nothing to
+  do" gives way to the temperature screen 10 minutes after the last update
+  with messages (or straight away, if that was already longer ago).
 
 ## Implementation steps
 

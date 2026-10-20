@@ -241,6 +241,9 @@ enum Command<'a> {
 enum Event {
     /// A `text` or `badge` command, carrying optional clock sync.
     Message {
+        /// Whether there's anything to show: always for `text`; for
+        /// `badge`, a count of 1 or more (0 is "nothing to do").
+        has_messages: bool,
         now: Option<i64>,
         utc_offset: Option<i32>,
     },
@@ -268,10 +271,21 @@ fn parse_event(line: &[u8]) -> Option<Event> {
     Some(match parse_command(line)? {
         Command::Text {
             now, utc_offset, ..
-        }
-        | Command::Badge {
-            now, utc_offset, ..
-        } => Event::Message { now, utc_offset },
+        } => Event::Message {
+            has_messages: true,
+            now,
+            utc_offset,
+        },
+        Command::Badge {
+            count,
+            now,
+            utc_offset,
+            ..
+        } => Event::Message {
+            has_messages: count > 0,
+            now,
+            utc_offset,
+        },
         Command::Time { now, utc_offset } => Event::Time { now, utc_offset },
         Command::Tap {} => Event::Tap,
         Command::Readings {
@@ -638,8 +652,9 @@ fn main() -> ! {
     let mut last_message: Option<HVec<u8, LINE_CAPACITY>> = None;
     let mut screen = Screen::Messages;
     let mut mode = draw_messages_screen(&mut disp, &layout, None, temperature);
-    // Uptime of the last message update (or tap back to the messages
-    // screen), and of when the temperature screen was last shown.
+    // Uptime of the last message update with something to show (or tap back
+    // to the messages screen), and of when the temperature screen was last
+    // shown.
     let mut last_message_secs: u64 = 0;
     let mut temp_since_secs: u64 = 0;
 
@@ -661,12 +676,20 @@ fn main() -> ! {
         if let Some(line) = line {
             red_led.set_high().unwrap();
             match parse_event(&line) {
-                Some(Event::Message { now, utc_offset }) => {
+                Some(Event::Message {
+                    has_messages,
+                    now,
+                    utc_offset,
+                }) => {
                     if let Some(now) = now {
                         clock.sync(now, utc_offset);
                     }
                     last_message = Some(line);
-                    last_message_secs = uptime;
+                    // A count-0 badge ("nothing to do") doesn't hold off
+                    // the switch to the temperature screen.
+                    if has_messages {
+                        last_message_secs = uptime;
+                    }
                     match screen {
                         Screen::Messages => {
                             mode = draw_messages_screen(
@@ -679,9 +702,11 @@ fn main() -> ! {
                             shown_clock = None;
                         }
                         // Only leave the temperature screen if it's been up
-                        // a while; otherwise the message waits until the
-                        // next switch back.
-                        Screen::Temp if uptime - temp_since_secs >= MIN_TEMP_SCREEN_S => {
+                        // a while and there's something to show; otherwise
+                        // the update waits until the next switch back.
+                        Screen::Temp
+                            if has_messages && uptime - temp_since_secs >= MIN_TEMP_SCREEN_S =>
+                        {
                             switch_to = Some(Screen::Messages);
                         }
                         Screen::Temp => {}
