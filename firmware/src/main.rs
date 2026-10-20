@@ -38,7 +38,7 @@ use embedded_graphics::primitives::{Circle, PrimitiveStyle, Rectangle};
 use embedded_graphics::text::{Alignment, Baseline, Text, TextStyleBuilder};
 use embedded_graphics::Pixel;
 
-use heapless::{String as HString, Vec as HVec};
+use heapless::{Deque, String as HString, Vec as HVec};
 use micromath::F32Ext;
 use serde::Deserialize;
 use static_cell::StaticCell;
@@ -48,6 +48,11 @@ use u8g2_fonts::{fonts, FontRenderer};
 use panic_halt as _;
 
 const LINE_CAPACITY: usize = 512;
+// Received lines waiting for the main loop, which handles one per pass.
+// Lets commands sent back to back (e.g. a time sync then a tap) all get
+// handled, rather than each overwriting the last. If the queue is full,
+// the oldest waiting line is dropped, so the newest state wins.
+const PENDING_LINES: usize = 4;
 // Wire-protocol cap on how many preview messages a command may carry. This is
 // deliberately larger than what the screen can show at once (see
 // `PREVIEW_LINE_PITCH` / the space check in the render loop below) — extras
@@ -502,8 +507,8 @@ static USB_ALLOCATOR: StaticCell<UsbBusAllocator<UsbBus>> = StaticCell::new();
 static USB_BUS: Mutex<RefCell<Option<UsbDevice<UsbBus>>>> = Mutex::new(RefCell::new(None));
 static USB_SERIAL: Mutex<RefCell<Option<SerialPort<UsbBus>>>> = Mutex::new(RefCell::new(None));
 static LINE_BUF: Mutex<RefCell<HVec<u8, LINE_CAPACITY>>> = Mutex::new(RefCell::new(HVec::new()));
-static PENDING_LINE: Mutex<RefCell<Option<HVec<u8, LINE_CAPACITY>>>> =
-    Mutex::new(RefCell::new(None));
+static PENDING: Mutex<RefCell<Deque<HVec<u8, LINE_CAPACITY>, PENDING_LINES>>> =
+    Mutex::new(RefCell::new(Deque::new()));
 
 #[entry]
 fn main() -> ! {
@@ -684,7 +689,7 @@ fn main() -> ! {
         let uptime = clock.uptime_secs();
         let mut switch_to: Option<Screen> = None;
 
-        let line = cortex_m::interrupt::free(|cs| PENDING_LINE.borrow(cs).borrow_mut().take());
+        let line = cortex_m::interrupt::free(|cs| PENDING.borrow(cs).borrow_mut().pop_front());
         if let Some(line) = line {
             red_led.set_high().unwrap();
             match parse_event(&line) {
@@ -1357,7 +1362,11 @@ fn poll_usb() {
                             b'\n' => {
                                 let line = line_buf.clone();
                                 line_buf.clear();
-                                PENDING_LINE.borrow(cs).replace(Some(line));
+                                let mut pending = PENDING.borrow(cs).borrow_mut();
+                                if pending.is_full() {
+                                    pending.pop_front();
+                                }
+                                let _ = pending.push_back(line);
                             }
                             b'\r' => {}
                             _ => {

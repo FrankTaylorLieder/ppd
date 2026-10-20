@@ -202,8 +202,9 @@ reading at or after `since`, oldest first, then a count:
 `since` gets `{"error":"<message>"}` instead. Readings over a year old are
 never returned, even while still in flash. The display freezes while the
 reply is sent (a day's readings take well under a second; a full year,
-~20MB, roughly a minute), and a command sent meanwhile may be lost. If the
-host stops reading for 2 seconds, the device gives up and carries on.
+~20MB, roughly a minute). Commands sent meanwhile wait in the queue
+described under Troubleshooting. If the host stops reading for 2 seconds,
+the device gives up and carries on.
 
 The CLI prints the same lines with `t` converted to local time
 (`2026-10-15T11:12:18+01:00`), or exactly as sent with `--utc`. Its
@@ -229,3 +230,6 @@ ppd-cli readings --since yesterday > since-yesterday.jsonl
   expected.
 - **Garbled or ignored messages**: the firmware's line buffer is 512 bytes
   (`LINE_CAPACITY` in `src/main.rs`); longer lines are silently dropped.
+  Received lines queue up for the main loop, which handles one per frame
+  (~40ms); up to 4 can wait (`PENDING_LINES`), and beyond that the oldest
+  waiting line is dropped.
